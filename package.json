@@ -1,0 +1,14 @@
+{
+  "name": "kuranko-sync-stock",
+  "version": "1.0.0",
+  "description": "Puente de sincronización de stock ERP -> WooCommerce (Kuranko)",
+  "main": "prueba.js",
+  "scripts": {
+    "prueba": "node prueba.js",
+    "sync": "node sync.js"
+  },
+  "dependencies": {
+    "mysql2": "^3.6.0",
+    "axios": "^1.6.0"
+  }
+}
