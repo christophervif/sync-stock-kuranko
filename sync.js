@@ -31,7 +31,6 @@
 
 const mysql = require('mysql2/promise');
 const axios = require('axios');
-const fs = require('fs');
 
 // ─── Configuración ──────────────────────────────────────────────────────────
 const PROD_URL = process.env.PROD_URL;
@@ -78,6 +77,25 @@ async function asegurarTablaMemoria(portalPool) {
       actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // Tabla de control: registra cada corrida del puente (para mostrar en el reporte)
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_corridas (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      corrio_en DATETIME DEFAULT CURRENT_TIMESTAMP,
+      productos_actualizados INT,
+      productos_error INT,
+      modo VARCHAR(20)
+    )
+  `);
+}
+
+// Registra una corrida terminada
+async function registrarCorrida(portalPool, actualizados, errores, modo) {
+  await portalPool.query(
+    `INSERT INTO sync_corridas (productos_actualizados, productos_error, modo)
+     VALUES (?, ?, ?)`,
+    [actualizados, errores, modo]
+  );
 }
 
 async function leerMemoria(portalPool) {
@@ -221,6 +239,8 @@ async function main() {
     const cambiados = filtrarCambiados(productos, memoria);
     console.log(`   ✓ ${cambiados.length} productos cambiaron (stock o precio).\n`);
 
+    let okTotal = 0, errTotal = 0;
+
     if (cambiados.length === 0) {
       console.log('   No hay cambios que sincronizar hoy. ✓');
     } else {
@@ -229,7 +249,6 @@ async function main() {
       const variaciones = cambiados.filter(p => p.product_type === 'variation');
       console.log(`4) A sincronizar: ${simples.length} simples, ${variaciones.length} variaciones.\n`);
 
-      let okTotal = 0, errTotal = 0;
       const sincronizados = [];
 
       // 4a. Productos simples → batch en /products/batch
@@ -302,25 +321,18 @@ async function main() {
       console.log(`\n   RESULTADO: ${okTotal} sincronizados, ${errTotal} con error.`);
     }
 
-    // 6. CSV de pendientes (productos sin woocommerce_id)
-    console.log('\n5) Generando CSV de productos pendientes (sin woocommerce_id)...');
-    const pendientes = await leerPendientesERP(prodPool);
-    if (pendientes.length) {
-      const cabecera = 'variation_id,sku,tipo,nombre_producto,variacion,precio_regular,stock\n';
-      const filas = pendientes.map(p =>
-        [p.variation_id, p.sku, p.product_type,
-         `"${(p.nombre_producto || '').replace(/"/g, '""')}"`,
-         `"${(p.variacion || '').replace(/"/g, '""')}"`,
-         p.regular_price || '', p.stock].join(',')
-      ).join('\n');
-      const ruta = '/tmp/pendientes.csv';
-      fs.writeFileSync(ruta, cabecera + filas);
-      console.log(`   ✓ ${pendientes.length} productos pendientes. CSV en: ${ruta}`);
-      console.log('   (Estos NO tienen woocommerce_id. Créalos manualmente en WooCommerce');
-      console.log('    y luego importa sus IDs al ERP con tu herramienta de importación.)');
+    // Registrar esta corrida (para que el reporte muestre la última fecha/hora)
+    if (!DRY_RUN) {
+      await registrarCorrida(portalPool, okTotal, errTotal, 'real');
     } else {
-      console.log('   ✓ No hay productos pendientes: todos tienen woocommerce_id.');
+      await registrarCorrida(portalPool, okTotal, errTotal, 'simulacion');
     }
+
+    // 6. Resumen de pendientes (el detalle se descarga desde el portal admin)
+    console.log('\n5) Revisando productos pendientes (sin woocommerce_id)...');
+    const pendientes = await leerPendientesERP(prodPool);
+    console.log(`   ✓ ${pendientes.length} productos pendientes de crear en WooCommerce.`);
+    console.log('   (Descarga el detalle desde el portal admin → Sincronización web.)');
 
     console.log('\n═══════════════════════════════════════════════════════════');
     console.log('  Sincronización terminada.');
