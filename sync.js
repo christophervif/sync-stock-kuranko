@@ -25,7 +25,7 @@
  *
  * Variables opcionales:
  *  - LOTE_SIZE         : productos por lote batch (default 100)
- *  - PAUSA_LOTE_MS     : pausa entre lotes en ms (default 8000 = 8s)
+ *  - PAUSA_LOTE_MS     : pausa entre lotes en ms (default 16000 = 16s)
  *  - DRY_RUN           : 'true' = solo simula, no escribe en WooCommerce (default false)
  */
 
@@ -38,8 +38,8 @@ const PORTAL_URL = process.env.PORTAL_URL;
 const WC_URL = (process.env.WC_URL || '').replace(/\/+$/, '');
 const WC_KEY = process.env.WC_CONSUMER_KEY;
 const WC_SECRET = process.env.WC_CONSUMER_SECRET;
-const LOTE_SIZE = parseInt(process.env.LOTE_SIZE || '100', 10);
-const PAUSA_LOTE_MS = parseInt(process.env.PAUSA_LOTE_MS || '8000', 10);
+const LOTE_SIZE = parseInt(process.env.LOTE_SIZE || '50', 10);
+const PAUSA_LOTE_MS = parseInt(process.env.PAUSA_LOTE_MS || '16000', 10);
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
 function validarConfig() {
@@ -85,6 +85,17 @@ async function asegurarTablaMemoria(portalPool) {
       productos_actualizados INT,
       productos_error INT,
       modo VARCHAR(20)
+    )
+  `);
+  // Tabla de discrepancias de SKU (woocommerce_id apunta a un SKU distinto).
+  // Se vacía y se vuelve a llenar en cada corrida real.
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_sku_alertas (
+      variation_id BIGINT PRIMARY KEY,
+      woocommerce_id BIGINT,
+      sku_erp VARCHAR(255),
+      sku_woo VARCHAR(255),
+      detectado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 }
@@ -209,6 +220,73 @@ function agruparVariacionesPorPadre(variaciones) {
   return grupos;
 }
 
+// ─── Validación de SKU por lote ─────────────────────────────────────────────
+// Lee los productos del lote desde WooCommerce (en 1 llamada) y compara el SKU.
+// Devuelve { validos: [...], discrepancias: [...] }
+// Los simples se leen por /products?include=ids; las variaciones por padre.
+async function validarSkuSimples(wc, lote) {
+  const validos = [], discrepancias = [];
+  try {
+    const ids = lote.map(p => p.wc_id).join(',');
+    const { data } = await wc.get(`/products`, { params: { include: ids, per_page: 100 } });
+    const skuPorId = {};
+    data.forEach(p => { skuPorId[p.id] = (p.sku || '').trim(); });
+    for (const p of lote) {
+      const skuWoo = skuPorId[p.wc_id];
+      if (skuWoo === undefined) {
+        // No se encontró en WooCommerce: lo dejamos pasar (lo tratará el batch, que dará su error)
+        validos.push(p);
+      } else if (skuWoo === (p.sku || '').trim()) {
+        validos.push(p);
+      } else {
+        discrepancias.push({ ...p, sku_woo: skuWoo });
+      }
+    }
+  } catch (e) {
+    // Si la lectura falla, por seguridad NO actualizamos a ciegas: mandamos todo a validar luego.
+    // Mejor dejarlos pasar al batch normal que perder la corrida; se registra en logs.
+    console.log(`   ⚠ No se pudo validar SKU de un lote de simples: ${e.message}. Se actualizan sin validar.`);
+    return { validos: lote, discrepancias: [] };
+  }
+  return { validos, discrepancias };
+}
+
+async function validarSkuVariaciones(wc, padre, lote) {
+  const validos = [], discrepancias = [];
+  try {
+    const ids = lote.map(p => p.wc_id).join(',');
+    const { data } = await wc.get(`/products/${padre}/variations`, { params: { include: ids, per_page: 100 } });
+    const skuPorId = {};
+    data.forEach(v => { skuPorId[v.id] = (v.sku || '').trim(); });
+    for (const p of lote) {
+      const skuWoo = skuPorId[p.wc_id];
+      if (skuWoo === undefined) {
+        validos.push(p);
+      } else if (skuWoo === (p.sku || '').trim()) {
+        validos.push(p);
+      } else {
+        discrepancias.push({ ...p, sku_woo: skuWoo });
+      }
+    }
+  } catch (e) {
+    console.log(`   ⚠ No se pudo validar SKU de variaciones del padre ${padre}: ${e.message}. Se actualizan sin validar.`);
+    return { validos: lote, discrepancias: [] };
+  }
+  return { validos, discrepancias };
+}
+
+// Guarda las discrepancias de SKU en la base del portal (reemplaza las anteriores)
+async function guardarDiscrepancias(portalPool, discrepancias) {
+  // Limpiar las anteriores (cada corrida refresca la lista)
+  await portalPool.query('DELETE FROM sync_sku_alertas');
+  if (!discrepancias.length) return;
+  const valores = discrepancias.map(d => [d.variation_id, d.wc_id, d.sku, d.sku_woo]);
+  await portalPool.query(
+    `INSERT INTO sync_sku_alertas (variation_id, woocommerce_id, sku_erp, sku_woo) VALUES ?`,
+    [valores]
+  );
+}
+
 // ─── Programa principal ─────────────────────────────────────────────────────
 async function main() {
   console.log('═══════════════════════════════════════════════════════════');
@@ -250,12 +328,24 @@ async function main() {
       console.log(`4) A sincronizar: ${simples.length} simples, ${variaciones.length} variaciones.\n`);
 
       const sincronizados = [];
+      const todasDiscrepancias = [];
 
-      // 4a. Productos simples → batch en /products/batch
+      // 4a. Productos simples → validar SKU por lote, luego batch
       for (let i = 0; i < simples.length; i += LOTE_SIZE) {
-        const lote = simples.slice(i, i + LOTE_SIZE);
+        const loteOriginal = simples.slice(i, i + LOTE_SIZE);
         const nLote = Math.floor(i / LOTE_SIZE) + 1;
+        // Validar SKU (lee el lote de WooCommerce en 1 llamada)
+        let lote = loteOriginal;
+        if (!DRY_RUN) {
+          const { validos, discrepancias } = await validarSkuSimples(wc, loteOriginal);
+          lote = validos;
+          todasDiscrepancias.push(...discrepancias);
+          if (discrepancias.length) {
+            console.log(`   ⚠ Lote simples #${nLote}: ${discrepancias.length} con SKU distinto (no se actualizan).`);
+          }
+        }
         console.log(`   Lote simples #${nLote}: ${lote.length} productos...`);
+        if (lote.length === 0) { if (i + LOTE_SIZE < simples.length) await pausa(PAUSA_LOTE_MS); continue; }
         if (!DRY_RUN) {
           try {
             await wc.post('/products/batch', construirPayloadSimple(lote));
@@ -273,7 +363,7 @@ async function main() {
         if (i + LOTE_SIZE < simples.length) await pausa(PAUSA_LOTE_MS);
       }
 
-      // 4b. Variaciones → batch por producto padre en /products/{padre}/variations/batch
+      // 4b. Variaciones → validar SKU por padre, luego batch
       if (variaciones.length) {
         if (simples.length) await pausa(PAUSA_LOTE_MS);
         const grupos = agruparVariacionesPorPadre(variaciones);
@@ -282,9 +372,18 @@ async function main() {
         let idx = 0;
         for (const padre of padres) {
           const grupo = grupos[padre];
-          // batch de variaciones de un padre (subdividir si supera el lote)
           for (let i = 0; i < grupo.length; i += LOTE_SIZE) {
-            const lote = grupo.slice(i, i + LOTE_SIZE);
+            const loteOriginal = grupo.slice(i, i + LOTE_SIZE);
+            let lote = loteOriginal;
+            if (!DRY_RUN) {
+              const { validos, discrepancias } = await validarSkuVariaciones(wc, padre, loteOriginal);
+              lote = validos;
+              todasDiscrepancias.push(...discrepancias);
+              if (discrepancias.length) {
+                console.log(`   ⚠ Variaciones padre ${padre}: ${discrepancias.length} con SKU distinto (no se actualizan).`);
+              }
+            }
+            if (lote.length === 0) continue;
             if (!DRY_RUN) {
               try {
                 await wc.post(`/products/${padre}/variations/batch`, {
@@ -310,6 +409,14 @@ async function main() {
           }
           idx++;
           if (idx < padres.length) await pausa(PAUSA_LOTE_MS);
+        }
+      }
+
+      // Guardar discrepancias de SKU para el reporte (solo en corrida real)
+      if (!DRY_RUN) {
+        await guardarDiscrepancias(portalPool, todasDiscrepancias);
+        if (todasDiscrepancias.length) {
+          console.log(`\n   ⚠ ${todasDiscrepancias.length} productos con SKU que no coincide (ver reporte en el portal).`);
         }
       }
 
