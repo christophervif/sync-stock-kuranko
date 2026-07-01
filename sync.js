@@ -41,6 +41,8 @@ const WC_SECRET = process.env.WC_CONSUMER_SECRET;
 const LOTE_SIZE = parseInt(process.env.LOTE_SIZE || '50', 10);
 const PAUSA_LOTE_MS = parseInt(process.env.PAUSA_LOTE_MS || '16000', 10);
 const DRY_RUN = process.env.DRY_RUN === 'true';
+// Modo manual "actualizar todo": ignora la memoria y reevalúa todos los productos.
+const FORZAR_TODO = process.env.FORZAR_TODO === 'true';
 
 function validarConfig() {
   const faltan = [];
@@ -98,6 +100,63 @@ async function asegurarTablaMemoria(portalPool) {
       detectado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // Detalle de la última corrida: lo que VARIÓ y lo que realmente se ACTUALIZÓ,
+  // con valores antes/después. Se vacía y se rellena en cada corrida.
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_detalle (
+      variation_id BIGINT PRIMARY KEY,
+      woocommerce_id BIGINT,
+      tipo VARCHAR(20),
+      stock_antes INT,
+      precio_antes DECIMAL(12,2),
+      stock_despues INT,
+      precio_despues DECIMAL(12,2),
+      se_aplico TINYINT(1) DEFAULT 0,
+      registrado_en DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  // Solicitudes de "actualizar todo" hechas desde el portal admin.
+  // El puente las recoge en su corrida y las marca como atendidas.
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_solicitudes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      solicitado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
+      atendida TINYINT(1) DEFAULT 0,
+      atendida_en DATETIME NULL
+    )
+  `);
+}
+
+// ¿Hay una solicitud de actualización completa pendiente?
+async function haySolicitudCompleta(portalPool) {
+  try {
+    const [[row]] = await portalPool.query(
+      `SELECT id FROM sync_solicitudes WHERE atendida = 0 ORDER BY id ASC LIMIT 1`);
+    return row ? row.id : null;
+  } catch (e) { return null; }
+}
+
+// Marca la solicitud como atendida
+async function marcarSolicitudAtendida(portalPool, id) {
+  await portalPool.query(
+    `UPDATE sync_solicitudes SET atendida = 1, atendida_en = NOW() WHERE id = ?`, [id]);
+}
+
+// Guarda el detalle de esta corrida (variaciones + si se aplicaron). Reemplaza el anterior.
+async function guardarDetalle(portalPool, filas) {
+  await portalPool.query('DELETE FROM sync_detalle');
+  if (!filas.length) return;
+  const valores = filas.map(f => [
+    f.variation_id, f.wc_id, f.tipo,
+    f.stock_antes, f.precio_antes, f.stock_despues, f.precio_despues,
+    f.se_aplico ? 1 : 0
+  ]);
+  await portalPool.query(
+    `INSERT INTO sync_detalle
+       (variation_id, woocommerce_id, tipo, stock_antes, precio_antes, stock_despues, precio_despues, se_aplico)
+     VALUES ?`,
+    [valores]
+  );
 }
 
 // Registra una corrida terminada
@@ -190,7 +249,11 @@ function filtrarCambiados(productos, memoria) {
     const prev = memoria[p.variation_id];
     // Cambió si: es nuevo (sin memoria), o el stock difiere, o el precio difiere
     if (!prev || prev.stock !== stock || prev.precio !== precio) {
-      cambiados.push({ ...p, stock, precio });
+      cambiados.push({
+        ...p, stock, precio,
+        stock_antes: prev ? prev.stock : null,
+        precio_antes: prev ? prev.precio : null
+      });
     }
   }
   return cambiados;
@@ -314,8 +377,17 @@ async function main() {
 
     // 3. Detectar cambios
     console.log('3) Detectando qué cambió desde la última vez...');
-    const cambiados = filtrarCambiados(productos, memoria);
-    console.log(`   ✓ ${cambiados.length} productos cambiaron (stock o precio).\n`);
+    // ¿Hay una solicitud de "actualizar todo" desde el portal? (o la variable de entorno)
+    const idSolicitud = await haySolicitudCompleta(portalPool);
+    const forzar = FORZAR_TODO || idSolicitud !== null;
+    // En modo forzar, usamos memoria vacía → todos cuentan como "cambiados".
+    const memoriaEfectiva = forzar ? {} : memoria;
+    if (forzar) {
+      const origen = idSolicitud !== null ? `solicitud del portal #${idSolicitud}` : 'variable FORZAR_TODO';
+      console.log(`   *** MODO ACTUALIZAR TODO (${origen}): se reevaluarán todos los productos ***`);
+    }
+    const cambiados = filtrarCambiados(productos, memoriaEfectiva);
+    console.log(`   ✓ ${cambiados.length} productos ${forzar ? 'a revisar' : 'cambiaron (stock o precio)'}.\n`);
 
     let okTotal = 0, errTotal = 0;
 
@@ -420,6 +492,28 @@ async function main() {
         }
       }
 
+      // Construir el detalle de la corrida: TODO lo que varió + si se aplicó o no.
+      // se_aplico=1 → pasó validación SKU y se escribió en WooCommerce.
+      // se_aplico=0 → varió pero no se aplicó (SKU no coincidió).
+      const aplicadosSet = new Set(sincronizados.map(s => s.variation_id));
+      const detalle = cambiados.map(c => {
+        // El "antes" real viene de la memoria verdadera (aun en modo forzar todo)
+        const prevReal = memoria[c.variation_id];
+        return {
+          variation_id: c.variation_id,
+          wc_id: c.wc_id,
+          tipo: c.product_type,
+          stock_antes: prevReal ? prevReal.stock : null,
+          precio_antes: prevReal ? prevReal.precio : null,
+          stock_despues: c.stock,
+          precio_despues: c.precio,
+          se_aplico: aplicadosSet.has(c.variation_id)
+        };
+      });
+      if (!DRY_RUN) {
+        await guardarDetalle(portalPool, detalle);
+      }
+
       // 5. Guardar memoria de los que se sincronizaron bien
       if (!DRY_RUN && sincronizados.length) {
         await guardarMemoria(portalPool, sincronizados);
@@ -431,6 +525,11 @@ async function main() {
     // Registrar esta corrida (para que el reporte muestre la última fecha/hora)
     if (!DRY_RUN) {
       await registrarCorrida(portalPool, okTotal, errTotal, 'real');
+      // Si esta corrida atendió una solicitud del portal, marcarla
+      if (idSolicitud !== null) {
+        await marcarSolicitudAtendida(portalPool, idSolicitud);
+        console.log(`   ✓ Solicitud de actualización completa #${idSolicitud} atendida.`);
+      }
     } else {
       await registrarCorrida(portalPool, okTotal, errTotal, 'simulacion');
     }
