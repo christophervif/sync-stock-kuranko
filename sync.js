@@ -125,6 +125,32 @@ async function asegurarTablaMemoria(portalPool) {
       atendida_en DATETIME NULL
     )
   `);
+  // Cola de SKUs específicos a forzar en la próxima corrida (pegados desde el portal).
+  // Se SUMAN a los que variaron; se procesan aunque no hayan cambiado; se vacían al usarse.
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_cola_sku (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      sku VARCHAR(255) NOT NULL,
+      agregado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
+      atendido TINYINT(1) DEFAULT 0,
+      atendido_en DATETIME NULL
+    )
+  `);
+}
+
+// Lee los SKUs pendientes en la cola manual (los que aún no se han atendido)
+async function leerColaSku(portalPool) {
+  try {
+    const [rows] = await portalPool.query(
+      `SELECT DISTINCT sku FROM sync_cola_sku WHERE atendido = 0`);
+    return rows.map(r => (r.sku || '').trim()).filter(Boolean);
+  } catch (e) { return []; }
+}
+
+// Marca toda la cola pendiente como atendida
+async function marcarColaAtendida(portalPool) {
+  await portalPool.query(
+    `UPDATE sync_cola_sku SET atendido = 1, atendido_en = NOW() WHERE atendido = 0`);
 }
 
 // ¿Hay una solicitud de actualización completa pendiente?
@@ -389,10 +415,46 @@ async function main() {
     const cambiados = filtrarCambiados(productos, memoriaEfectiva);
     console.log(`   ✓ ${cambiados.length} productos ${forzar ? 'a revisar' : 'cambiaron (stock o precio)'}.\n`);
 
+    // 3b. Sumar los SKUs de la cola manual (pegados desde el portal).
+    // Se fuerzan aunque no hayan cambiado; se deduplican por variation_id.
+    const colaSku = await leerColaSku(portalPool);
+    let skusNoEncontrados = [];
+    if (colaSku.length) {
+      console.log(`3b) Cola manual: ${colaSku.length} SKU(s) para forzar.`);
+      const setSku = new Set(colaSku.map(s => s.toLowerCase()));
+      const yaIncluidos = new Set(cambiados.map(c => c.variation_id));
+      // Buscar esos SKUs en el catálogo del ERP
+      const forzadosPorSku = productos.filter(p =>
+        setSku.has((p.sku || '').trim().toLowerCase()) && !yaIncluidos.has(p.variation_id));
+      // Detectar cuáles SKUs pegados no existen en el ERP (para Alertas)
+      const skusEncontrados = new Set(productos.map(p => (p.sku || '').trim().toLowerCase()));
+      skusNoEncontrados = colaSku.filter(s => !skusEncontrados.has(s.toLowerCase()));
+      // Agregar los forzados (con su stock/precio actual y marca de "antes" desde memoria real)
+      forzadosPorSku.forEach(p => {
+        cambiados.push({
+          ...p,
+          stock: Number(p.stock) || 0,
+          precio: p.regular_price === null ? null : Number(p.regular_price),
+          stock_antes: memoria[p.variation_id] ? memoria[p.variation_id].stock : null,
+          precio_antes: memoria[p.variation_id] ? memoria[p.variation_id].precio : null,
+          _forzado_manual: true
+        });
+      });
+      console.log(`   ✓ ${forzadosPorSku.length} agregados desde la cola (${skusNoEncontrados.length} SKU no existen en el ERP).\n`);
+    }
+
     let okTotal = 0, errTotal = 0;
 
     if (cambiados.length === 0) {
       console.log('   No hay cambios que sincronizar hoy. ✓');
+      // Aun sin cambios, registrar en Alertas los SKUs de la cola que no existen en el ERP
+      if (!DRY_RUN && skusNoEncontrados.length) {
+        const alertas = skusNoEncontrados.map(sku => ({
+          variation_id: 0, wc_id: 0, sku: sku, sku_woo: '(no existe en el ERP)'
+        }));
+        await guardarDiscrepancias(portalPool, alertas);
+        console.log(`   ⚠ ${skusNoEncontrados.length} SKU(s) de la cola no existen en el ERP (ver Alertas).`);
+      }
     } else {
       // 4. Separar simples y variaciones
       const simples = cambiados.filter(p => p.product_type === 'simple');
@@ -486,9 +548,15 @@ async function main() {
 
       // Guardar discrepancias de SKU para el reporte (solo en corrida real)
       if (!DRY_RUN) {
+        // Sumar los SKUs de la cola que NO existen en el ERP (para que se vean en Alertas)
+        skusNoEncontrados.forEach(sku => {
+          todasDiscrepancias.push({
+            variation_id: 0, wc_id: 0, sku: sku, sku_woo: '(no existe en el ERP)'
+          });
+        });
         await guardarDiscrepancias(portalPool, todasDiscrepancias);
         if (todasDiscrepancias.length) {
-          console.log(`\n   ⚠ ${todasDiscrepancias.length} productos con SKU que no coincide (ver reporte en el portal).`);
+          console.log(`\n   ⚠ ${todasDiscrepancias.length} productos con SKU que no coincide o no existe (ver reporte en el portal).`);
         }
       }
 
@@ -520,6 +588,12 @@ async function main() {
       }
 
       console.log(`\n   RESULTADO: ${okTotal} sincronizados, ${errTotal} con error.`);
+    }
+
+    // Marcar la cola de SKUs manuales como atendida (haya habido cambios o no)
+    if (!DRY_RUN && colaSku.length) {
+      await marcarColaAtendida(portalPool);
+      console.log(`   ✓ Cola de ${colaSku.length} SKU(s) manual(es) atendida.`);
     }
 
     // Registrar esta corrida (para que el reporte muestre la última fecha/hora)
