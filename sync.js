@@ -76,9 +76,14 @@ async function asegurarTablaMemoria(portalPool) {
       woocommerce_id BIGINT,
       ultimo_stock INT,
       ultimo_precio DECIMAL(12,2),
+      ultima_oferta DECIMAL(12,2),
       actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // Por si la tabla ya existía sin la columna de oferta
+  try {
+    await portalPool.query(`ALTER TABLE sync_estado ADD COLUMN ultima_oferta DECIMAL(12,2)`);
+  } catch (e) { /* la columna ya existe */ }
   // Tabla de control: registra cada corrida del puente (para mostrar en el reporte)
   await portalPool.query(`
     CREATE TABLE IF NOT EXISTS sync_corridas (
@@ -111,10 +116,15 @@ async function asegurarTablaMemoria(portalPool) {
       precio_antes DECIMAL(12,2),
       stock_despues INT,
       precio_despues DECIMAL(12,2),
+      oferta_antes DECIMAL(12,2),
+      oferta_despues DECIMAL(12,2),
       se_aplico TINYINT(1) DEFAULT 0,
       registrado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // Por si la tabla ya existía sin las columnas de oferta
+  try { await portalPool.query(`ALTER TABLE sync_detalle ADD COLUMN oferta_antes DECIMAL(12,2)`); } catch (e) {}
+  try { await portalPool.query(`ALTER TABLE sync_detalle ADD COLUMN oferta_despues DECIMAL(12,2)`); } catch (e) {}
   // Solicitudes de "actualizar todo" hechas desde el portal admin.
   // El puente las recoge en su corrida y las marca como atendidas.
   await portalPool.query(`
@@ -131,20 +141,31 @@ async function asegurarTablaMemoria(portalPool) {
     CREATE TABLE IF NOT EXISTS sync_cola_sku (
       id INT AUTO_INCREMENT PRIMARY KEY,
       sku VARCHAR(255) NOT NULL,
+      actualizar_oferta TINYINT(1) DEFAULT 0,
       agregado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
       atendido TINYINT(1) DEFAULT 0,
       atendido_en DATETIME NULL
     )
   `);
+  // Por si la tabla ya existía sin la columna nueva, la agrega (ignora error si ya está)
+  try {
+    await portalPool.query(`ALTER TABLE sync_cola_sku ADD COLUMN actualizar_oferta TINYINT(1) DEFAULT 0`);
+  } catch (e) { /* la columna ya existe */ }
 }
 
-// Lee los SKUs pendientes en la cola manual (los que aún no se han atendido)
+// Lee los SKUs pendientes en la cola manual (los que aún no se han atendido).
+// Devuelve también si alguna tanda pidió actualizar el precio oferta.
 async function leerColaSku(portalPool) {
   try {
     const [rows] = await portalPool.query(
-      `SELECT DISTINCT sku FROM sync_cola_sku WHERE atendido = 0`);
-    return rows.map(r => (r.sku || '').trim()).filter(Boolean);
-  } catch (e) { return []; }
+      `SELECT DISTINCT sku, actualizar_oferta FROM sync_cola_sku WHERE atendido = 0`);
+    const skus = rows.map(r => (r.sku || '').trim()).filter(Boolean);
+    // Set de SKUs (en minúscula) cuya tanda pidió actualizar oferta
+    const conOferta = new Set(
+      rows.filter(r => r.actualizar_oferta === 1)
+          .map(r => (r.sku || '').trim().toLowerCase()).filter(Boolean));
+    return { skus, conOferta };
+  } catch (e) { return { skus: [], conOferta: new Set() }; }
 }
 
 // Marca toda la cola pendiente como atendida
@@ -175,11 +196,13 @@ async function guardarDetalle(portalPool, filas) {
   const valores = filas.map(f => [
     f.variation_id, f.wc_id, f.tipo,
     f.stock_antes, f.precio_antes, f.stock_despues, f.precio_despues,
+    f.oferta_antes === undefined ? null : f.oferta_antes,
+    f.oferta_despues === undefined ? null : f.oferta_despues,
     f.se_aplico ? 1 : 0
   ]);
   await portalPool.query(
     `INSERT INTO sync_detalle
-       (variation_id, woocommerce_id, tipo, stock_antes, precio_antes, stock_despues, precio_despues, se_aplico)
+       (variation_id, woocommerce_id, tipo, stock_antes, precio_antes, stock_despues, precio_despues, oferta_antes, oferta_despues, se_aplico)
      VALUES ?`,
     [valores]
   );
@@ -196,13 +219,14 @@ async function registrarCorrida(portalPool, actualizados, errores, modo) {
 
 async function leerMemoria(portalPool) {
   const [rows] = await portalPool.query(
-    `SELECT variation_id, ultimo_stock, ultimo_precio FROM sync_estado`
+    `SELECT variation_id, ultimo_stock, ultimo_precio, ultima_oferta FROM sync_estado`
   );
   const mapa = {};
   rows.forEach(r => {
     mapa[r.variation_id] = {
       stock: r.ultimo_stock,
-      precio: r.ultimo_precio === null ? null : Number(r.ultimo_precio)
+      precio: r.ultimo_precio === null ? null : Number(r.ultimo_precio),
+      oferta: r.ultima_oferta === null ? null : Number(r.ultima_oferta)
     };
   });
   return mapa;
@@ -211,17 +235,30 @@ async function leerMemoria(portalPool) {
 // Guarda en memoria los que se sincronizaron con éxito (en lote)
 async function guardarMemoria(portalPool, registros) {
   if (!registros.length) return;
-  const valores = registros.map(r => [r.variation_id, r.wc_id, r.stock, r.precio]);
+  // Solo los registros que actualizaron oferta traen un valor; los demás mandan
+  // undefined y COALESCE conserva la oferta que ya estaba guardada.
+  const valores = registros.map(r => [
+    r.variation_id, r.wc_id, r.stock, r.precio,
+    r._actualizar_oferta ? (r.oferta === undefined ? null : r.oferta) : null,
+    r._actualizar_oferta ? 1 : 0   // bandera: ¿esta fila trae oferta nueva?
+  ]);
   await portalPool.query(
-    `INSERT INTO sync_estado (variation_id, woocommerce_id, ultimo_stock, ultimo_precio)
-     VALUES ?
+    `INSERT INTO sync_estado (variation_id, woocommerce_id, ultimo_stock, ultimo_precio, ultima_oferta)
+     VALUES ${valores.map(() => '(?,?,?,?,?)').join(',')}
      ON DUPLICATE KEY UPDATE
        woocommerce_id = VALUES(woocommerce_id),
        ultimo_stock   = VALUES(ultimo_stock),
        ultimo_precio  = VALUES(ultimo_precio),
        actualizado_en = NOW()`,
-    [valores]
+    valores.flatMap(v => v.slice(0, 5))
   );
+  // Actualizar la oferta SOLO de los que la actualizaron (para no borrar la de los demás)
+  const conOferta = registros.filter(r => r._actualizar_oferta);
+  for (const r of conOferta) {
+    await portalPool.query(
+      `UPDATE sync_estado SET ultima_oferta = ? WHERE variation_id = ?`,
+      [r.oferta === undefined ? null : r.oferta, r.variation_id]);
+  }
 }
 
 // ─── Leer ERP (SOLO LECTURA) ────────────────────────────────────────────────
@@ -234,6 +271,7 @@ async function leerProductosERP(prodPool) {
             pv.product_type,
             pv.sku,
             pv.regular_price,
+            pv.sale_price,
             COALESCE(SUM(ls.quantity), 0) AS stock
      FROM product_variations pv
      JOIN products p ON p.id = pv.product_id
@@ -241,7 +279,7 @@ async function leerProductosERP(prodPool) {
      WHERE pv.woocommerce_id IS NOT NULL
        AND pv.product_type IN ('variation','simple')
        AND pv.deleted_at IS NULL
-     GROUP BY pv.id, pv.woocommerce_id, p.woocommerce_id, pv.product_type, pv.sku, pv.regular_price
+     GROUP BY pv.id, pv.woocommerce_id, p.woocommerce_id, pv.product_type, pv.sku, pv.regular_price, pv.sale_price
      ORDER BY pv.id`
   );
   return rows;
@@ -289,13 +327,21 @@ function filtrarCambiados(productos, memoria) {
 // Separa productos simples de variaciones (van en endpoints distintos)
 function construirPayloadSimple(lote) {
   return {
-    update: lote.map(p => ({
-      id: p.wc_id,
-      manage_stock: true,
-      stock_quantity: p.stock,
-      stock_status: p.stock > 0 ? 'instock' : 'outofstock',
-      regular_price: p.precio === null ? '' : String(p.precio)
-    }))
+    update: lote.map(p => {
+      const item = {
+        id: p.wc_id,
+        manage_stock: true,
+        stock_quantity: p.stock,
+        stock_status: p.stock > 0 ? 'instock' : 'outofstock',
+        regular_price: p.precio === null ? '' : String(p.precio)
+      };
+      // Solo los SKUs manuales cuya tanda pidió oferta actualizan sale_price.
+      // Si el ERP no tiene oferta, se manda vacío (WooCommerce muestra el precio regular).
+      if (p._actualizar_oferta) {
+        item.sale_price = (p.oferta === null || p.oferta === undefined) ? '' : String(p.oferta);
+      }
+      return item;
+    })
   };
 }
 
@@ -417,7 +463,8 @@ async function main() {
 
     // 3b. Sumar los SKUs de la cola manual (pegados desde el portal).
     // Se fuerzan aunque no hayan cambiado; se deduplican por variation_id.
-    const colaSku = await leerColaSku(portalPool);
+    const cola = await leerColaSku(portalPool);
+    const colaSku = cola.skus;
     let skusNoEncontrados = [];
     if (colaSku.length) {
       console.log(`3b) Cola manual: ${colaSku.length} SKU(s) para forzar.`);
@@ -429,18 +476,30 @@ async function main() {
       // Detectar cuáles SKUs pegados no existen en el ERP (para Alertas)
       const skusEncontrados = new Set(productos.map(p => (p.sku || '').trim().toLowerCase()));
       skusNoEncontrados = colaSku.filter(s => !skusEncontrados.has(s.toLowerCase()));
-      // Agregar los forzados (con su stock/precio actual y marca de "antes" desde memoria real)
+      // Agregar los forzados. Marca oferta si su tanda lo pidió.
       forzadosPorSku.forEach(p => {
+        const skuLow = (p.sku || '').trim().toLowerCase();
         cambiados.push({
           ...p,
           stock: Number(p.stock) || 0,
           precio: p.regular_price === null ? null : Number(p.regular_price),
+          oferta: p.sale_price === null ? null : Number(p.sale_price),
           stock_antes: memoria[p.variation_id] ? memoria[p.variation_id].stock : null,
           precio_antes: memoria[p.variation_id] ? memoria[p.variation_id].precio : null,
-          _forzado_manual: true
+          _forzado_manual: true,
+          _actualizar_oferta: cola.conOferta.has(skuLow)
         });
       });
-      console.log(`   ✓ ${forzadosPorSku.length} agregados desde la cola (${skusNoEncontrados.length} SKU no existen en el ERP).\n`);
+      // También marcar los que YA estaban en cambiados pero están en una tanda con oferta
+      cambiados.forEach(c => {
+        const skuLow = (c.sku || '').trim().toLowerCase();
+        if (cola.conOferta.has(skuLow)) {
+          c._actualizar_oferta = true;
+          c.oferta = c.sale_price === null || c.sale_price === undefined ? null : Number(c.sale_price);
+        }
+      });
+      const nOferta = cambiados.filter(c => c._actualizar_oferta).length;
+      console.log(`   ✓ ${forzadosPorSku.length} agregados desde la cola (${skusNoEncontrados.length} SKU no existen en el ERP). ${nOferta} con precio oferta.\n`);
     }
 
     let okTotal = 0, errTotal = 0;
@@ -521,13 +580,19 @@ async function main() {
             if (!DRY_RUN) {
               try {
                 await wc.post(`/products/${padre}/variations/batch`, {
-                  update: lote.map(v => ({
-                    id: v.wc_id,
-                    manage_stock: true,
-                    stock_quantity: v.stock,
-                    stock_status: v.stock > 0 ? 'instock' : 'outofstock',
-                    regular_price: v.precio === null ? '' : String(v.precio)
-                  }))
+                  update: lote.map(v => {
+                    const item = {
+                      id: v.wc_id,
+                      manage_stock: true,
+                      stock_quantity: v.stock,
+                      stock_status: v.stock > 0 ? 'instock' : 'outofstock',
+                      regular_price: v.precio === null ? '' : String(v.precio)
+                    };
+                    if (v._actualizar_oferta) {
+                      item.sale_price = (v.oferta === null || v.oferta === undefined) ? '' : String(v.oferta);
+                    }
+                    return item;
+                  })
                 });
                 okTotal += lote.length;
                 sincronizados.push(...lote);
@@ -575,6 +640,9 @@ async function main() {
           precio_antes: prevReal ? prevReal.precio : null,
           stock_despues: c.stock,
           precio_despues: c.precio,
+          // Oferta: solo se registra para los que la actualizaron. "Antes" desde memoria.
+          oferta_antes: c._actualizar_oferta ? (prevReal ? prevReal.oferta : null) : null,
+          oferta_despues: c._actualizar_oferta ? (c.oferta === undefined ? null : c.oferta) : null,
           se_aplico: aplicadosSet.has(c.variation_id)
         };
       });
