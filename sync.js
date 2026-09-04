@@ -125,9 +125,12 @@ async function asegurarTablaMemoria(portalPool) {
       woocommerce_id BIGINT,
       sku_erp VARCHAR(255),
       sku_woo VARCHAR(255),
+      motivo VARCHAR(80),
       detectado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // Por si la tabla ya existía sin la columna de motivo
+  try { await portalPool.query(`ALTER TABLE sync_sku_alertas ADD COLUMN motivo VARCHAR(80)`); } catch (e) {}
   // Detalle de la última corrida: lo que VARIÓ y lo que realmente se ACTUALIZÓ,
   // con valores antes/después. Se vacía y se rellena en cada corrida.
   await portalPool.query(`
@@ -397,7 +400,7 @@ async function validarSkuSimples(wc, lote) {
       } else if (skuWoo === (p.sku || '').trim()) {
         validos.push(p);
       } else {
-        discrepancias.push({ ...p, sku_woo: skuWoo });
+        discrepancias.push({ ...p, sku_woo: skuWoo, motivo: 'SKU no coincide' });
       }
     }
   } catch (e) {
@@ -423,7 +426,7 @@ async function validarSkuVariaciones(wc, padre, lote) {
       } else if (skuWoo === (p.sku || '').trim()) {
         validos.push(p);
       } else {
-        discrepancias.push({ ...p, sku_woo: skuWoo });
+        discrepancias.push({ ...p, sku_woo: skuWoo, motivo: 'SKU no coincide' });
       }
     }
   } catch (e) {
@@ -433,14 +436,26 @@ async function validarSkuVariaciones(wc, padre, lote) {
   return { validos, discrepancias };
 }
 
-// Guarda las discrepancias de SKU en la base del portal (reemplaza las anteriores)
+// Traduce un error de escritura de WooCommerce a un motivo legible
+function motivoEscritura(msg) {
+  const m = String(msg || '');
+  if (/invalid.?id|no v[aá]lido|not\s*found|404|does not exist|no existe|resource/i.test(m)) return 'ID no existe en la web';
+  return 'Error al escribir: ' + m.slice(0, 100);
+}
+
+// Guarda las NO-sincronizadas (con su motivo) en la base del portal (reemplaza las anteriores).
+// Motivos: 'SKU no coincide' | 'ID no existe en la web' | 'Error al escribir: …' | 'No existe en el ERP'
 async function guardarDiscrepancias(portalPool, discrepancias) {
-  // Limpiar las anteriores (cada corrida refresca la lista)
-  await portalPool.query('DELETE FROM sync_sku_alertas');
+  await portalPool.query('DELETE FROM sync_sku_alertas'); // cada corrida refresca la lista
   if (!discrepancias.length) return;
-  const valores = discrepancias.map(d => [d.variation_id, d.wc_id, d.sku, d.sku_woo]);
+  // variation_id es PK: para las filas sin variación real (0) usamos ids negativos únicos
+  let neg = -1;
+  const valores = discrepancias.map(d => {
+    const vid = (d.variation_id && d.variation_id > 0) ? d.variation_id : (neg--);
+    return [vid, d.wc_id || 0, d.sku || '', d.sku_woo || '', d.motivo || 'SKU no coincide'];
+  });
   await portalPool.query(
-    `INSERT INTO sync_sku_alertas (variation_id, woocommerce_id, sku_erp, sku_woo) VALUES ?`,
+    `INSERT INTO sync_sku_alertas (variation_id, woocommerce_id, sku_erp, sku_woo, motivo) VALUES ?`,
     [valores]
   );
 }
@@ -532,7 +547,7 @@ async function main() {
       // Aun sin cambios, registrar en Alertas los SKUs de la cola que no existen en el ERP
       if (!DRY_RUN && skusNoEncontrados.length) {
         const alertas = skusNoEncontrados.map(sku => ({
-          variation_id: 0, wc_id: 0, sku: sku, sku_woo: '(no existe en el ERP)'
+          variation_id: 0, wc_id: 0, sku: sku, sku_woo: '', motivo: 'No existe en el ERP'
         }));
         await guardarDiscrepancias(portalPool, alertas);
         console.log(`   ⚠ ${skusNoEncontrados.length} SKU(s) de la cola no existen en el ERP (ver Alertas).`);
@@ -569,12 +584,16 @@ async function main() {
             okTotal += ok.length; sincronizados.push(...ok);
             if (fail.length) {
               errTotal += fail.length;
-              fail.forEach(f => console.log(`   ✗ simple ${f.sku} (wc ${f.wc_id}): ${f._err}`));
+              fail.forEach(f => {
+                console.log(`   ✗ simple ${f.sku} (wc ${f.wc_id}): ${f._err}`);
+                todasDiscrepancias.push({ variation_id: f.variation_id, wc_id: f.wc_id, sku: f.sku, sku_woo: '', motivo: motivoEscritura(f._err) });
+              });
             }
           } catch (e) {
             errTotal += lote.length;
             const msg = e.response ? `HTTP ${e.response.status}` : e.message;
             console.log(`   ✗ Error en lote simples #${nLote}: ${msg}`);
+            lote.forEach(p => todasDiscrepancias.push({ variation_id: p.variation_id, wc_id: p.wc_id, sku: p.sku, sku_woo: '', motivo: motivoEscritura(msg) }));
           }
         } else {
           okTotal += lote.length;
@@ -625,12 +644,16 @@ async function main() {
                 okTotal += ok.length; sincronizados.push(...ok);
                 if (fail.length) {
                   errTotal += fail.length;
-                  fail.forEach(f => console.log(`   ✗ variación ${f.sku} (wc ${f.wc_id}): ${f._err}`));
+                  fail.forEach(f => {
+                    console.log(`   ✗ variación ${f.sku} (wc ${f.wc_id}): ${f._err}`);
+                    todasDiscrepancias.push({ variation_id: f.variation_id, wc_id: f.wc_id, sku: f.sku, sku_woo: '', motivo: motivoEscritura(f._err) });
+                  });
                 }
               } catch (e) {
                 errTotal += lote.length;
                 const msg = e.response ? `HTTP ${e.response.status}` : e.message;
                 console.log(`   ✗ Error en variaciones del padre ${padre}: ${msg}`);
+                lote.forEach(p => todasDiscrepancias.push({ variation_id: p.variation_id, wc_id: p.wc_id, sku: p.sku, sku_woo: '', motivo: motivoEscritura(msg) }));
               }
             } else {
               okTotal += lote.length;
@@ -647,7 +670,7 @@ async function main() {
         // Sumar los SKUs de la cola que NO existen en el ERP (para que se vean en Alertas)
         skusNoEncontrados.forEach(sku => {
           todasDiscrepancias.push({
-            variation_id: 0, wc_id: 0, sku: sku, sku_woo: '(no existe en el ERP)'
+            variation_id: 0, wc_id: 0, sku: sku, sku_woo: '', motivo: 'No existe en el ERP'
           });
         });
         await guardarDiscrepancias(portalPool, todasDiscrepancias);
