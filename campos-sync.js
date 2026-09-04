@@ -43,6 +43,66 @@ async function prepararTablasCampos(portalPool) {
   // Por si la tabla ya existía sin las columnas nuevas
   try { await portalPool.query(`ALTER TABLE sync_estado_padre ADD COLUMN categorias MEDIUMTEXT`); } catch (e) {}
   try { await portalPool.query(`ALTER TABLE sync_estado_padre ADD COLUMN etiquetas TEXT`); } catch (e) {}
+  // Detalle de campos ricos actualizados en la última corrida (para el reporte).
+  // Se vacía y se rellena en cada corrida real. Una fila por (producto/variación, campo).
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_detalle_campos (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      sku VARCHAR(255),
+      woocommerce_id BIGINT,
+      nivel VARCHAR(20),
+      campo VARCHAR(40),
+      antes MEDIUMTEXT,
+      despues MEDIUMTEXT,
+      se_aplico TINYINT(1) DEFAULT 0,
+      registrado_en DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+}
+
+// ── Etiquetas legibles para el reporte ──────────────────────────────────────
+const NOM_CAMPO = {
+  backorders: 'Reservas agotados', weight: 'Peso', length: 'Largo', width: 'Ancho', height: 'Alto',
+  name: 'Nombre', publicado: 'Publicado', featured: 'Destacado', visibility: 'Visibilidad',
+  short_description: 'Descripción corta', categorias: 'Categorías', etiquetas: 'Etiquetas'
+};
+function valLegible(campo, v) {
+  v = (v == null) ? '' : String(v);
+  if (campo === 'publicado') return { publish: 'Publicado', private: 'Privado', draft: 'Borrador' }[v] || v;
+  if (campo === 'featured') return (v === '1' || v === 1) ? 'Sí' : 'No';
+  if (campo === 'visibility') return v === 'hidden' ? 'Oculto' : (v === 'visible' ? 'Visible' : v);
+  if (campo === 'short_description') return v ? 'Con aviso "A pedido"' : 'Sin aviso';
+  if (campo === 'backorders') return { no: 'No', notify: 'Notificar', yes: 'Sí' }[v] || v;
+  return v;
+}
+// Diferencias campo a campo entre 'antes' (memoria) y 'ahora' (calculado)
+function diffCampos(campos, prev, listaCampos) {
+  const prevO = prev || {};
+  const out = [];
+  for (const c of listaCampos) {
+    const a = (prevO[c] == null) ? '' : String(prevO[c]);
+    const d = (campos[c] == null) ? '' : String(campos[c]);
+    if (a === d) continue;
+    const la = valLegible(c, a), ld = valLegible(c, d);
+    if (la === ld) continue; // mismo significado (ej: '' y '0' en Destacado) → no es cambio real
+    out.push({ campo: c, antes: la, despues: ld });
+  }
+  return out;
+}
+const CAMPOS_VAR = ['backorders', 'weight', 'length', 'width', 'height'];
+const CAMPOS_PADRE = ['name', 'publicado', 'featured', 'visibility', 'short_description', 'categorias', 'etiquetas'];
+
+async function guardarDetalleCampos(portalPool, filas) {
+  await portalPool.query('DELETE FROM sync_detalle_campos');
+  if (!filas.length) return;
+  // Insertar en tandas para no exceder el tamaño de paquete
+  const CH = 500;
+  for (let i = 0; i < filas.length; i += CH) {
+    const t = filas.slice(i, i + CH);
+    await portalPool.query(
+      `INSERT INTO sync_detalle_campos (sku, woocommerce_id, nivel, campo, antes, despues, se_aplico)
+       VALUES ${t.map(() => '(?,?,?,?,?,?,?)').join(',')}`,
+      t.flatMap(f => [f.sku, f.wc_id, f.nivel, NOM_CAMPO[f.campo] || f.campo, f.antes, f.despues, f.se_aplico]));
+  }
 }
 
 // Categorías del ERP por product_id -> "ruta1, ruta2" (jerarquía completa)
@@ -246,18 +306,16 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
   const varCambiadas = [];
   for (const r of rows) {
     const campos = calcularVariacion(r);
-    if (!igualVar(campos, memVar[r.variation_id])) {
-      varCambiadas.push({ ...r, campos });
-    }
+    const diffs = diffCampos(campos, memVar[r.variation_id], CAMPOS_VAR);
+    if (diffs.length) varCambiadas.push({ ...r, campos, _diffs: diffs });
   }
   // 2) Detectar padres/simples cuyos campos cambiaron (incluye categorías y etiquetas)
   const padres = calcularPadres(rows, catMap, tagMap);
   const padreCambiado = [];
   for (const [pid, info] of padres) {
     const prev = memPadre[pid];
-    if (!igualPadre(info.campos, prev)) {
-      padreCambiado.push({ product_id: pid, ...info, prev });
-    }
+    const diffs = diffCampos(info.campos, prev, CAMPOS_PADRE);
+    if (diffs.length) padreCambiado.push({ product_id: pid, ...info, prev, _diffs: diffs });
   }
   console.log(`   Cambios detectados: ${varCambiadas.length} variaciones, ${padreCambiado.length} productos (nivel padre).`);
 
@@ -351,6 +409,18 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
   // 6) Guardar memoria SOLO de lo que se aplicó bien
   if (varOk.length) await guardarMemoriaVar(portalPool, varOk);
   if (padreOk.length) await guardarMemoriaPadre(portalPool, padreOk);
+
+  // 6b) Guardar el DETALLE de campos actualizados (para el reporte del portal)
+  const okVarIds = new Set(varOk.map(v => v.variation_id));
+  const okPadreIds = new Set(padreOk.map(p => p.product_id));
+  const detalle = [];
+  varCambiadas.forEach(v => (v._diffs || []).forEach(d => detalle.push({
+    sku: v.sku, wc_id: v.wc_id, nivel: 'variación', campo: d.campo,
+    antes: d.antes, despues: d.despues, se_aplico: okVarIds.has(v.variation_id) ? 1 : 0 })));
+  padreCambiado.forEach(p => (p._diffs || []).forEach(d => detalle.push({
+    sku: p.sku_ref, wc_id: p.wc_target, nivel: (p.tipo === 'simple' ? 'producto' : 'producto padre'), campo: d.campo,
+    antes: d.antes, despues: d.despues, se_aplico: okPadreIds.has(p.product_id) ? 1 : 0 })));
+  await guardarDetalleCampos(portalPool, detalle);
 
   const rtax = tax.resumen();
   if (rtax.categoriasCreadas.length) console.log(`   + Categorías nuevas creadas en la web (${rtax.categoriasCreadas.length}): ${[...new Set(rtax.categoriasCreadas)].slice(0,20).join(' · ')}`);
