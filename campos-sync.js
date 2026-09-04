@@ -286,6 +286,13 @@ function payloadVarCampos(v) {
 
 const pausa = (ms) => new Promise(r => setTimeout(r, ms));
 
+// Detalle legible del error de WooCommerce (código + mensaje), no solo "HTTP 400".
+function detWC(e) {
+  const d = e.response && e.response.data;
+  if (d) return `HTTP ${e.response.status} ${d.code || ''} ${d.message || ''}`.trim();
+  return e.message;
+}
+
 // ─── Orquestador de la fase ─────────────────────────────────────────────────
 async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE = 50, PAUSA = 16000, PAUSA_ITEM = 700 }) {
   console.log('\n──────────── FASE CAMPOS RICOS (nombre, publicado, visibilidad, etc.) ────────────');
@@ -351,20 +358,31 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
         body = { ...body, ...simplesVarCampos[p.wc_target] }; // fusiona reservas/peso/dims del simple
         delete simplesVarCampos[p.wc_target]; // ya lo mandamos aquí
       }
-      // Categorías/etiquetas: solo si cambiaron vs memoria (resuelve nombre->ID, crea las que falten)
+      // Categorías/etiquetas: solo si cambiaron vs memoria (resuelve nombre->ID, crea las que falten).
+      // Se resuelven en un try PROPIO: si falla la taxonomía, igual actualizamos los demás campos
+      // (nombre/publicado/visibilidad/descripción) en vez de perder todo el producto.
+      // Nunca mandamos categories/tags = [] vacío: eso BORRARÍA las categorías/etiquetas del producto.
       const prev = p.prev || {};
       if (s(p.campos.categorias) !== s(prev.categorias)) {
-        body.categories = await tax.resolverCategorias(p.campos.categorias);
+        try {
+          const cats = await tax.resolverCategorias(p.campos.categorias);
+          if (cats.length) body.categories = cats;
+          else if (p.campos.categorias) console.log(`   ⚠ ${p.sku_ref}: no se pudieron resolver categorías; se omiten (no se tocan).`);
+        } catch (e) { console.log(`   ⚠ ${p.sku_ref}: categorías omitidas → ${e.message}`); }
       }
       if (s(p.campos.etiquetas) !== s(prev.etiquetas)) {
-        body.tags = await tax.resolverEtiquetas(p.campos.etiquetas);
+        try {
+          const tags = await tax.resolverEtiquetas(p.campos.etiquetas);
+          if (tags.length) body.tags = tags;
+          else if (p.campos.etiquetas) console.log(`   ⚠ ${p.sku_ref}: no se pudieron resolver etiquetas; se omiten (no se tocan).`);
+        } catch (e) { console.log(`   ⚠ ${p.sku_ref}: etiquetas omitidas → ${e.message}`); }
       }
       await wc.put(`/products/${p.wc_target}`, body);
       okPadre++; padreOk.push(p);
       if (p.tipo === 'simple') { const v = varCambiadas.find(x => x.wc_id === p.wc_target); if (v) { okVar++; varOk.push(v); } }
     } catch (e) {
-      err++; const msg = e.response ? `HTTP ${e.response.status}` : e.message;
-      console.log(`   ✗ padre ${p.sku_ref} (wc ${p.wc_target}): ${msg}`);
+      err++;
+      console.log(`   ✗ padre ${p.sku_ref} (wc ${p.wc_target}): ${detWC(e)}`);
     }
   }
 
@@ -376,7 +394,7 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
     try {
       await wc.put(`/products/${v.wc_id}`, simplesVarCampos[v.wc_id]);
       okVar++; varOk.push(v);
-    } catch (e) { err++; console.log(`   ✗ simple ${v.sku} (wc ${v.wc_id}): ${e.response?('HTTP '+e.response.status):e.message}`); }
+    } catch (e) { err++; console.log(`   ✗ simple ${v.sku} (wc ${v.wc_id}): ${detWC(e)}`); }
   }
 
   // 5) VARIACIONES (de productos variable) → batch por padre, con lectura del resultado por ítem
@@ -400,7 +418,7 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
         }
       } catch (e) {
         err += lote.length;
-        console.log(`   ✗ lote variaciones padre ${padre}: ${e.response?('HTTP '+e.response.status):e.message}`);
+        console.log(`   ✗ lote variaciones padre ${padre}: ${detWC(e)}`);
       }
       if (i + LOTE < grupo.length) await pausa(PAUSA);
     }
