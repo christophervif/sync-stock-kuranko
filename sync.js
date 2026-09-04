@@ -31,6 +31,9 @@
 
 const mysql = require('mysql2/promise');
 const axios = require('axios');
+const { sincronizarCamposRicos } = require('./campos-sync');
+// Activa/desactiva la fase de campos ricos (nombre, publicado, visibilidad, etc.)
+const SYNC_CAMPOS = process.env.SYNC_CAMPOS !== 'false'; // por defecto activada
 
 // ─── Configuración ──────────────────────────────────────────────────────────
 const PROD_URL = process.env.PROD_URL;
@@ -40,6 +43,9 @@ const WC_KEY = process.env.WC_CONSUMER_KEY;
 const WC_SECRET = process.env.WC_CONSUMER_SECRET;
 const LOTE_SIZE = parseInt(process.env.LOTE_SIZE || '50', 10);
 const PAUSA_LOTE_MS = parseInt(process.env.PAUSA_LOTE_MS || '16000', 10);
+// Pausa corta entre cada escritura individual de campos ricos (producto padre,
+// categorías, etiquetas). Suave, sin ráfagas. Ajustable si hace falta ir más lento.
+const PAUSA_ITEM_MS = parseInt(process.env.PAUSA_ITEM_MS || '700', 10);
 const DRY_RUN = process.env.DRY_RUN === 'true';
 // Modo manual "actualizar todo": ignora la memoria y reevalúa todos los productos.
 const FORZAR_TODO = process.env.FORZAR_TODO === 'true';
@@ -66,6 +72,23 @@ function wcClient() {
     timeout: 60000,
     headers: { 'Content-Type': 'application/json' }
   });
+}
+
+// Lee la respuesta de un /batch de WooCommerce y separa OK vs error POR ÍTEM.
+// El batch responde con update[]; si un objeto trae .error, ese ítem NO se aplicó.
+// Así un producto malo ya no arrastra a los demás del lote.
+function separarBatch(data, lote) {
+  const errById = {};
+  const arr = (data && (data.update || data)) || [];
+  (Array.isArray(arr) ? arr : []).forEach(u => {
+    if (u && u.error) errById[u.id] = (u.error && u.error.message) || 'error';
+  });
+  const ok = [], fail = [];
+  for (const p of lote) {
+    if (errById[p.wc_id]) fail.push({ ...p, _err: errById[p.wc_id] });
+    else ok.push(p);
+  }
+  return { ok, fail };
 }
 
 // ─── Memoria de cambios (en la base del portal) ─────────────────────────────
@@ -541,9 +564,13 @@ async function main() {
         if (lote.length === 0) { if (i + LOTE_SIZE < simples.length) await pausa(PAUSA_LOTE_MS); continue; }
         if (!DRY_RUN) {
           try {
-            await wc.post('/products/batch', construirPayloadSimple(lote));
-            okTotal += lote.length;
-            sincronizados.push(...lote);
+            const { data } = await wc.post('/products/batch', construirPayloadSimple(lote));
+            const { ok, fail } = separarBatch(data, lote);
+            okTotal += ok.length; sincronizados.push(...ok);
+            if (fail.length) {
+              errTotal += fail.length;
+              fail.forEach(f => console.log(`   ✗ simple ${f.sku} (wc ${f.wc_id}): ${f._err}`));
+            }
           } catch (e) {
             errTotal += lote.length;
             const msg = e.response ? `HTTP ${e.response.status}` : e.message;
@@ -579,7 +606,7 @@ async function main() {
             if (lote.length === 0) continue;
             if (!DRY_RUN) {
               try {
-                await wc.post(`/products/${padre}/variations/batch`, {
+                const { data } = await wc.post(`/products/${padre}/variations/batch`, {
                   update: lote.map(v => {
                     const item = {
                       id: v.wc_id,
@@ -594,8 +621,12 @@ async function main() {
                     return item;
                   })
                 });
-                okTotal += lote.length;
-                sincronizados.push(...lote);
+                const { ok, fail } = separarBatch(data, lote);
+                okTotal += ok.length; sincronizados.push(...ok);
+                if (fail.length) {
+                  errTotal += fail.length;
+                  fail.forEach(f => console.log(`   ✗ variación ${f.sku} (wc ${f.wc_id}): ${f._err}`));
+                }
               } catch (e) {
                 errTotal += lote.length;
                 const msg = e.response ? `HTTP ${e.response.status}` : e.message;
@@ -674,6 +705,20 @@ async function main() {
       }
     } else {
       await registrarCorrida(portalPool, okTotal, errTotal, 'simulacion');
+    }
+
+    // 5b. FASE CAMPOS RICOS (aditiva): nombre, publicado, destacado, visibilidad,
+    //     descripción corta, reservas, peso y dimensiones. Misma condición: solo
+    //     productos en la web y solo lo que cambió vs la última corrida.
+    if (SYNC_CAMPOS) {
+      try {
+        await sincronizarCamposRicos({
+          prodPool, portalPool, wc, DRY_RUN,
+          LOTE: LOTE_SIZE, PAUSA: PAUSA_LOTE_MS, PAUSA_ITEM: PAUSA_ITEM_MS
+        });
+      } catch (e) {
+        console.error('   ✗ Error en la fase de campos ricos:', e.message);
+      }
     }
 
     // 6. Resumen de pendientes (el detalle se descarga desde el portal admin)
