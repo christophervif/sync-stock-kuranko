@@ -24,6 +24,18 @@ async function prepararTabla(portalPool) {
       id TINYINT PRIMARY KEY,
       corrio_en DATETIME
     )`);
+  // Productos que están en la WEB pero NO existen en el ERP (cruce por SKU).
+  // La llena esta misma recolección: catálogo web − catálogo ERP. La lee el
+  // portal para la pestaña "En la web, no en el ERP" del botón "Exportar".
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_web_sin_erp (
+      woocommerce_id BIGINT PRIMARY KEY,
+      sku VARCHAR(255),
+      tipo VARCHAR(20),
+      nombre VARCHAR(255),
+      imagenes MEDIUMTEXT,
+      actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
 }
 
 async function estaFresco(portalPool, horas) {
@@ -49,22 +61,39 @@ async function leerPendientes(prodPool) {
   return rows;
 }
 
-// Catálogo de WooCommerce EN BLOQUE → mapa sku(minúsc.) -> {id, type, images[]}
+// Catálogo de WooCommerce EN BLOQUE.
+// Devuelve { map, all }:
+//   · map = sku(minúsc.) -> {id, type, images[]}  (para cruzar los pendientes)
+//   · all = lista de TODOS los productos web {id, sku, type, name, images[]}
+//           (incluye los que no tienen SKU) para detectar "web sin ERP".
 async function mapaProductosWC(wc, PAUSA) {
   const map = new Map();
+  const all = [];
   let page = 1;
   while (true) {
-    const { data } = await wc.get('/products', { params: { per_page: 100, page, status: 'any', _fields: 'id,sku,type,images' } });
+    const { data } = await wc.get('/products', { params: { per_page: 100, page, status: 'any', _fields: 'id,sku,type,name,images' } });
     const arr = data || [];
     arr.forEach(p => {
-      const sk = (p.sku || '').trim().toLowerCase();
-      if (sk) map.set(sk, { id: p.id, type: p.type, images: (p.images || []).map(i => i.src).filter(Boolean) });
+      const images = (p.images || []).map(i => i.src).filter(Boolean);
+      const sku = (p.sku || '').trim();
+      const sk = sku.toLowerCase();
+      all.push({ id: p.id, sku, type: p.type, name: p.name || '', images });
+      if (sk) map.set(sk, { id: p.id, type: p.type, images });
     });
     if (arr.length < 100) break;
     page++; if (page > 300) break;
     await pausa(PAUSA);
   }
-  return map;
+  return { map, all };
+}
+
+// Todos los SKUs que existen en el ERP (cualquier tipo), en minúscula, para el cruce.
+async function leerSkusErp(prodPool) {
+  const [rows] = await prodPool.query(
+    `SELECT DISTINCT LOWER(TRIM(sku)) AS sku
+       FROM product_variations
+      WHERE deleted_at IS NULL AND TRIM(sku) <> ''`);
+  return new Set(rows.map(r => r.sku));
 }
 
 async function recolectarPendientesWeb({ prodPool, portalPool, wc, PAUSA_ITEM = 700, REFRESH_H = 6, FORCE = false }) {
@@ -81,8 +110,15 @@ async function recolectarPendientesWeb({ prodPool, portalPool, wc, PAUSA_ITEM = 
     await portalPool.query(`INSERT INTO sync_pendientes_web_ts (id, corrio_en) VALUES (1, NOW()) ON DUPLICATE KEY UPDATE corrio_en = NOW()`);
     return { total: 0, conId: 0 };
   }
-  const mapa = await mapaProductosWC(wc, PAUSA_ITEM);
+  const { map: mapa, all: webAll } = await mapaProductosWC(wc, PAUSA_ITEM);
   console.log(`   ${mapa.size} productos leídos del catálogo web.`);
+  // Web − ERP: productos de la web cuyo SKU no existe en el ERP (o sin SKU en la web).
+  const skusErp = await leerSkusErp(prodPool);
+  const webSinErp = webAll.filter(p => {
+    const sk = (p.sku || '').trim().toLowerCase();
+    return !sk || !skusErp.has(sk);
+  });
+  console.log(`   ${webSinErp.length} productos en la web que NO están en el ERP.`);
 
   const resultados = []; // {sku, tipo, wc_id, imagenes}
   const variacionesPend = [];
@@ -124,6 +160,17 @@ async function recolectarPendientesWeb({ prodPool, portalPool, wc, PAUSA_ITEM = 
        ON DUPLICATE KEY UPDATE tipo=VALUES(tipo), woocommerce_id=VALUES(woocommerce_id), imagenes=VALUES(imagenes)`,
       t.flatMap(r => [r.sku, r.tipo, r.wc_id, r.imagenes]));
   }
+
+  // Guardar "web sin ERP" (reemplaza lo anterior)
+  await portalPool.query('DELETE FROM sync_web_sin_erp');
+  for (let i = 0; i < webSinErp.length; i += CH) {
+    const t = webSinErp.slice(i, i + CH);
+    await portalPool.query(
+      `INSERT INTO sync_web_sin_erp (woocommerce_id, sku, tipo, nombre, imagenes) VALUES ${t.map(() => '(?,?,?,?,?)').join(',')}
+       ON DUPLICATE KEY UPDATE sku=VALUES(sku), tipo=VALUES(tipo), nombre=VALUES(nombre), imagenes=VALUES(imagenes)`,
+      t.flatMap(r => [r.id, r.sku, r.type, r.name, (r.images || []).join(', ')]));
+  }
+
   await portalPool.query(`INSERT INTO sync_pendientes_web_ts (id, corrio_en) VALUES (1, NOW()) ON DUPLICATE KEY UPDATE corrio_en = NOW()`);
   const conId = resultados.filter(r => r.wc_id).length;
   console.log(`   ${conId}/${resultados.length} encontrados en la web (con ID). Guardado para el botón "Exportar productos sin ID".`);
