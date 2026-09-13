@@ -25,6 +25,8 @@
  *
  * Variables opcionales:
  *  - LOTE_SIZE         : productos por lote batch (default 100)
+ *  - LOTE_SIMPLES      : productos simples por lote batch (default 10, más chico
+ *                        que LOTE_SIZE para no saturar /products/batch en el hosting)
  *  - PAUSA_LOTE_MS     : pausa entre lotes en ms (default 16000 = 16s)
  *  - DRY_RUN           : 'true' = solo simula, no escribe en WooCommerce (default false)
  */
@@ -46,6 +48,10 @@ const WC_URL = (process.env.WC_URL || '').replace(/\/+$/, '');
 const WC_KEY = process.env.WC_CONSUMER_KEY;
 const WC_SECRET = process.env.WC_CONSUMER_SECRET;
 const LOTE_SIZE = parseInt(process.env.LOTE_SIZE || '50', 10);
+// Los productos simples van en lotes más chicos: /products/batch es más pesado
+// en el servidor y una sola petición grande puede tumbar el hosting compartido
+// (HTTP 500). Con lotes chicos y las pausas entre lotes se reparte la carga.
+const LOTE_SIMPLES = parseInt(process.env.LOTE_SIMPLES || '10', 10);
 const PAUSA_LOTE_MS = parseInt(process.env.PAUSA_LOTE_MS || '16000', 10);
 // Pausa corta entre cada escritura individual de campos ricos (producto padre,
 // categorías, etiquetas). Suave, sin ráfagas. Ajustable si hace falta ir más lento.
@@ -566,9 +572,9 @@ async function main() {
       const todasDiscrepancias = [];
 
       // 4a. Productos simples → validar SKU por lote, luego batch
-      for (let i = 0; i < simples.length; i += LOTE_SIZE) {
-        const loteOriginal = simples.slice(i, i + LOTE_SIZE);
-        const nLote = Math.floor(i / LOTE_SIZE) + 1;
+      for (let i = 0; i < simples.length; i += LOTE_SIMPLES) {
+        const loteOriginal = simples.slice(i, i + LOTE_SIMPLES);
+        const nLote = Math.floor(i / LOTE_SIMPLES) + 1;
         // Validar SKU (lee el lote de WooCommerce en 1 llamada)
         let lote = loteOriginal;
         if (!DRY_RUN) {
@@ -580,7 +586,7 @@ async function main() {
           }
         }
         console.log(`   Lote simples #${nLote}: ${lote.length} productos...`);
-        if (lote.length === 0) { if (i + LOTE_SIZE < simples.length) await pausa(PAUSA_LOTE_MS); continue; }
+        if (lote.length === 0) { if (i + LOTE_SIMPLES < simples.length) await pausa(PAUSA_LOTE_MS); continue; }
         if (!DRY_RUN) {
           try {
             const { data } = await wc.post('/products/batch', construirPayloadSimple(lote));
@@ -603,7 +609,7 @@ async function main() {
           okTotal += lote.length;
           sincronizados.push(...lote);
         }
-        if (i + LOTE_SIZE < simples.length) await pausa(PAUSA_LOTE_MS);
+        if (i + LOTE_SIMPLES < simples.length) await pausa(PAUSA_LOTE_MS);
       }
 
       // 4b. Variaciones → validar SKU por padre, luego batch
