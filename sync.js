@@ -35,10 +35,14 @@ const mysql = require('mysql2/promise');
 const axios = require('axios');
 const { sincronizarCamposRicos } = require('./campos-sync');
 const { recolectarPendientesWeb } = require('./pendientes-web');
+const { sincronizarImagenes } = require('./imagenes-sync');
 // Activa/desactiva la fase de campos ricos (nombre, publicado, visibilidad, etc.)
 const SYNC_CAMPOS = process.env.SYNC_CAMPOS !== 'false'; // por defecto activada
 // Recolección "productos sin ID" (ID + imágenes de la web) para el botón del portal.
 const SYNC_PENDIENTES_WEB = process.env.SYNC_PENDIENTES_WEB !== 'false'; // por defecto activada
+// Fase de imágenes: rellena en la web SOLO los productos/variaciones sin imagen,
+// usando la galería del ERP. Se apoya en el catálogo web de la recolección anterior.
+const SYNC_IMAGENES = process.env.SYNC_IMAGENES !== 'false'; // por defecto activada
 const PENDIENTES_WEB_REFRESH_H = parseInt(process.env.PENDIENTES_WEB_REFRESH_H || '6', 10);
 
 // ─── Configuración ──────────────────────────────────────────────────────────
@@ -758,11 +762,18 @@ async function main() {
     //     pendientes (solo LEE, en bloque, como máximo cada PENDIENTES_WEB_REFRESH_H horas).
     if (SYNC_PENDIENTES_WEB) {
       try {
-        await recolectarPendientesWeb({
+        const rweb = await recolectarPendientesWeb({
           prodPool, portalPool, wc,
           PAUSA_ITEM: PAUSA_ITEM_MS, REFRESH_H: PENDIENTES_WEB_REFRESH_H,
           FORCE: process.env.PENDIENTES_WEB_FORCE === 'true'
         });
+        // 5d. FASE IMÁGENES (aditiva): rellena en la web solo lo que no tiene imagen,
+        //     reutilizando el catálogo web (webAll) que acaba de leer la recolección.
+        if (SYNC_IMAGENES && rweb && rweb.webAll) {
+          try {
+            await sincronizarImagenes({ prodPool, portalPool, wc, DRY_RUN, webAll: rweb.webAll });
+          } catch (e) { console.error('   ✗ Error en la fase de imágenes:', e.message); }
+        }
       } catch (e) { console.error('   ✗ Error recolectando "productos sin ID":', e.message); }
     }
 
