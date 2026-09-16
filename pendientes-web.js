@@ -174,7 +174,9 @@ async function recolectarPendientesWeb({ prodPool, portalPool, wc, PAUSA_ITEM = 
   await portalPool.query(`INSERT INTO sync_pendientes_web_ts (id, corrio_en) VALUES (1, NOW()) ON DUPLICATE KEY UPDATE corrio_en = NOW()`);
   const conId = resultados.filter(r => r.wc_id).length;
   console.log(`   ${conId}/${resultados.length} encontrados en la web (con ID). Guardado para el botón "Exportar productos sin ID".`);
-  return { total: resultados.length, conId };
+  // Devolvemos también el catálogo web completo para reutilizarlo (p. ej. la fase
+  // de imágenes) sin volver a leer la tienda en la misma corrida.
+  return { total: resultados.length, conId, webAll };
 }
 
 module.exports = { recolectarPendientesWeb };
