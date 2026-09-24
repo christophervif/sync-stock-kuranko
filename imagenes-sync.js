@@ -55,9 +55,12 @@ async function filtrarVivos(urls, timeoutMs, pausaMs) {
   return { vivos, muertos };
 }
 
-// Imágenes del ERP para una lista de SKUs. Devuelve mapa sku(min) → {tipo, own[], prod[]}
-//   own  = imágenes propias de la variación/simple (product_variation_id)
-//   prod = imágenes a nivel de producto/padre (product_variation_id NULL)
+// Imágenes del ERP para una lista de SKUs. Devuelve mapa sku(min) → {tipo, own[], prod[], galeria[]}
+//   own     = imágenes propias de la variación/simple (product_variation_id = su id)
+//   prod    = imágenes a nivel de producto/padre (product_variation_id NULL)
+//   galeria = TODAS las imágenes del producto (nivel producto + las de todas sus
+//             variantes). Sirve de respaldo para el padre variable cuando en el ERP
+//             las fotos están colgadas de las variantes y no a nivel de producto.
 async function imagenesErpDeSkus(prodPool, skus) {
   const map = new Map();
   if (!skus.length) return map;
@@ -67,22 +70,35 @@ async function imagenesErpDeSkus(prodPool, skus) {
        FROM product_variations pv
       WHERE pv.deleted_at IS NULL AND LOWER(TRIM(pv.sku)) IN (${ph})`, skus);
   if (!rows.length) return map;
-  const vids = rows.map(r => r.vid);
   const pids = [...new Set(rows.map(r => r.product_id))];
+  // Traemos las imágenes por product_id EFECTIVO: el de la propia fila, o —si la
+  // imagen está colgada de una variación— el del padre de esa variación (vía JOIN).
+  // Así capturamos las fotos aunque el ERP no guarde product_id en la fila de imagen.
+  const phP = pids.map(() => '?').join(',');
   const [imgs] = await prodPool.query(
-    `SELECT product_id, product_variation_id, path
-       FROM product_images
-      WHERE deleted_at IS NULL
-        AND (product_variation_id IN (${vids.map(() => '?').join(',')})
-             OR product_id IN (${pids.map(() => '?').join(',')}))
-      ORDER BY is_primary DESC, sort_order ASC, id ASC`, [...vids, ...pids]);
-  const byVar = {}, byProd = {};
+    `SELECT pi.product_variation_id AS vid,
+            COALESCE(pi.product_id, pvv.product_id) AS pid,
+            (pi.product_variation_id IS NULL) AS nivel_prod,
+            pi.path
+       FROM product_images pi
+       LEFT JOIN product_variations pvv ON pvv.id = pi.product_variation_id
+      WHERE pi.deleted_at IS NULL
+        AND COALESCE(pi.product_id, pvv.product_id) IN (${phP})
+      ORDER BY pi.is_primary DESC, pi.sort_order ASC, pi.id ASC`, pids);
+  const byVar = {}, byProd = {}, galeria = {};
   imgs.forEach(im => {
-    if (!im.path) return;
+    if (!im.path || im.pid == null) return;
+    (galeria[im.pid] = galeria[im.pid] || []).push(im.path);
     if (im.product_variation_id != null) (byVar[im.product_variation_id] = byVar[im.product_variation_id] || []).push(im.path);
-    else if (im.product_id != null) (byProd[im.product_id] = byProd[im.product_id] || []).push(im.path);
+    else if (im.nivel_prod) (byProd[im.pid] = byProd[im.pid] || []).push(im.path);
   });
-  rows.forEach(r => { map.set(r.sku, { tipo: r.tipo, own: byVar[r.vid] || [], prod: byProd[r.product_id] || [] }); });
+  const dedup = (a) => [...new Set((a || []).filter(Boolean))];
+  rows.forEach(r => map.set(r.sku, {
+    tipo: r.tipo,
+    own: dedup(byVar[r.vid]),
+    prod: dedup(byProd[r.product_id]),
+    galeria: dedup(galeria[r.product_id])
+  }));
   return map;
 }
 
@@ -157,7 +173,11 @@ async function sincronizarImagenes({
 
     const erp = erpProd.get((cand.sku || '').trim().toLowerCase());
     if (!erp) continue;                                              // no está en el ERP → sin imágenes que subir
-    let urls = esPadre ? erp.prod : (erp.own.length ? erp.own : erp.prod);
+    // Padre: galería de producto y, si no tiene, la unión de sus variantes.
+    // Simple: su imagen propia, luego la de producto, luego lo que haya.
+    let urls = esPadre
+      ? (erp.prod.length ? erp.prod : erp.galeria)
+      : (erp.own.length ? erp.own : (erp.prod.length ? erp.prod : erp.galeria));
     urls = [...new Set((urls || []).filter(Boolean))];
     if (!urls.length) continue;                                     // el ERP tampoco tiene imágenes
 
