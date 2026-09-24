@@ -31,15 +31,51 @@ async function prepararTabla(portalPool) {
       detalle VARCHAR(255),
       intento_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+  // Misma tabla de detalle que usa la fase de campos ricos. Aquí escribimos las
+  // imágenes subidas como una fila más (campo "Imágenes"), para que salgan en la
+  // columna "Campos actualizados" de las hojas Variaciones/Actualizados del reporte.
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_detalle_campos (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      sku VARCHAR(255),
+      woocommerce_id BIGINT,
+      nivel VARCHAR(20),
+      campo VARCHAR(40),
+      antes MEDIUMTEXT,
+      despues MEDIUMTEXT,
+      se_aplico TINYINT(1) DEFAULT 0,
+      registrado_en DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
 }
+
+// Escribe las imágenes subidas en sync_detalle_campos (fila "Imágenes"), para que
+// el reporte las muestre junto a stock/precio/campos. Reemplaza solo sus propias
+// filas ("Imágenes"), sin tocar las de campos ricos.
+async function guardarDetalleImagenes(portalPool, exitos) {
+  await portalPool.query(`DELETE FROM sync_detalle_campos WHERE campo = 'Imágenes'`);
+  if (!exitos.length) return;
+  const valores = exitos.map(e => [e.sku || '', e.wc || 0, e.nivel || '', 'Imágenes', 'sin imagen', `${e.n || 0} imagen(es) subida(s)`, 1]);
+  await portalPool.query(
+    `INSERT INTO sync_detalle_campos (sku, woocommerce_id, nivel, campo, antes, despues, se_aplico)
+     VALUES ${valores.map(() => '(?,?,?,?,?,?,?)').join(',')}`,
+    valores.flat());
+}
+
+// Cabeceras "de navegador": muchos CDN de proveedores (bike24, topeak, etc.)
+// rechazan peticiones sin User-Agent aunque la imagen exista. Con esto evitamos
+// marcar como "no accesible" imágenes que en realidad sí cargan.
+const NAV_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+};
 
 // ¿El link responde? HEAD y, si no lo permiten, GET de 1 byte. Desde el puente.
 async function linkVivo(url, timeoutMs) {
-  const base = { timeout: timeoutMs, maxRedirects: 3, validateStatus: s => s >= 200 && s < 400 };
-  try { await axios.head(url, base); return true; }
+  const base = { timeout: timeoutMs, maxRedirects: 5, validateStatus: s => s >= 200 && s < 400 };
+  try { await axios.head(url, { ...base, headers: NAV_HEADERS }); return true; }
   catch (e) {
     try {
-      await axios.get(url, { ...base, responseType: 'arraybuffer', headers: { Range: 'bytes=0-0' } });
+      await axios.get(url, { ...base, responseType: 'arraybuffer', headers: { ...NAV_HEADERS, Range: 'bytes=0-0' } });
       return true;
     } catch (e2) { return false; }
   }
@@ -192,7 +228,7 @@ async function sincronizarImagenes({
     try {
       const { data } = await wc.put(`/products/${cand.id}`, { images: vivos.map(u => ({ src: u })) });
       if (data && Array.isArray(data.images) && data.images.length > 0) {
-        registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'ok', detalle: `${data.images.length} imagen(es)` });
+        registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'ok', detalle: `${data.images.length} imagen(es)`, n: data.images.length });
         console.log(`   ✓ ${nivel} ${cand.sku} (wc ${cand.id}): ${data.images.length} imagen(es).`);
       } else {
         const det = 'WooCommerce no guardó las imágenes';
@@ -260,7 +296,7 @@ async function sincronizarImagenes({
       try {
         const { data } = await wc.put(`/products/${padre.id}/variations/${v.id}`, { image: { src: vivos[0] } });
         if (data && data.image && data.image.src) {
-          registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'ok', detalle: '1 imagen' });
+          registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'ok', detalle: '1 imagen', n: 1 });
           console.log(`   ✓ variación ${v.sku} (wc ${v.id}): 1 imagen.`);
         } else {
           const det = 'WooCommerce no guardó la imagen';
@@ -279,8 +315,12 @@ async function sincronizarImagenes({
 
   await guardarMemoria(portalPool, registros);
   await guardarAlertasImg(portalPool, alertas);
+  // Éxitos de esta corrida → al detalle de campos, para que aparezcan en el reporte
+  // (columna "Campos actualizados" de Variaciones/Actualizados), no en hoja aparte.
+  const exitos = registros.filter(r => r.estado === 'ok' && r.nivel !== 'padre-insp');
+  await guardarDetalleImagenes(portalPool, exitos);
 
-  const subidas = registros.filter(r => r.estado === 'ok' && r.nivel !== 'padre-insp').length;
+  const subidas = exitos.length;
   const fallidas = alertas.length;
   console.log(`   RESULTADO imágenes: ${subidas} subidas, ${fallidas} con alerta (tope ${MAX} por corrida).`);
   if (intentos >= MAX) console.log('   (Se alcanzó el tope de la corrida; el resto continúa en la próxima.)');
