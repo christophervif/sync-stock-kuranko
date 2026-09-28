@@ -48,13 +48,20 @@ async function prepararTabla(portalPool) {
     )`);
 }
 
-// Escribe las imágenes subidas en sync_detalle_campos (fila "Imágenes"), para que
-// el reporte las muestre junto a stock/precio/campos. Reemplaza solo sus propias
-// filas ("Imágenes"), sin tocar las de campos ricos.
-async function guardarDetalleImagenes(portalPool, exitos) {
+// Escribe el detalle de imágenes en sync_detalle_campos (fila "Imágenes"), para que
+// el reporte las muestre junto a stock/precio/campos. Misma lógica que el resto:
+//   · Éxitos (se_aplico=1)  → salen en "Variaciones" Y en "Actualizados".
+//   · Fallos  (se_aplico=0) → salen en "Variaciones" (todo lo detectado) pero NO
+//     en "Actualizados"; su motivo además va en "Alertas de vinculación".
+// Reemplaza solo sus propias filas ("Imágenes"), sin tocar las de campos ricos.
+async function guardarDetalleImagenes(portalPool, exitos, fallos) {
   await portalPool.query(`DELETE FROM sync_detalle_campos WHERE campo = 'Imágenes'`);
-  if (!exitos.length) return;
-  const valores = exitos.map(e => [e.sku || '', e.wc || 0, e.nivel || '', 'Imágenes', 'sin imagen', `${e.n || 0} imagen(es) subida(s)`, 1]);
+  const valores = [];
+  exitos.forEach(e => valores.push(
+    [e.sku || '', e.wc || 0, e.nivel || '', 'Imágenes', 'sin imagen', `${e.n || 0} imagen(es) subida(s)`, 1]));
+  (fallos || []).forEach(a => valores.push(
+    [a.sku || '', a.wc || 0, '', 'Imágenes', 'sin imagen', `no se pudo subir — ${a.motivo || 'error'}`, 0]));
+  if (!valores.length) return;
   await portalPool.query(
     `INSERT INTO sync_detalle_campos (sku, woocommerce_id, nivel, campo, antes, despues, se_aplico)
      VALUES ${valores.map(() => '(?,?,?,?,?,?,?)').join(',')}`,
@@ -318,7 +325,7 @@ async function sincronizarImagenes({
   // Éxitos de esta corrida → al detalle de campos, para que aparezcan en el reporte
   // (columna "Campos actualizados" de Variaciones/Actualizados), no en hoja aparte.
   const exitos = registros.filter(r => r.estado === 'ok' && r.nivel !== 'padre-insp');
-  await guardarDetalleImagenes(portalPool, exitos);
+  await guardarDetalleImagenes(portalPool, exitos, alertas);
 
   const subidas = exitos.length;
   const fallidas = alertas.length;
