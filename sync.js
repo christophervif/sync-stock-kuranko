@@ -139,12 +139,16 @@ async function asegurarTablaMemoria(portalPool) {
       woocommerce_id BIGINT,
       sku_erp VARCHAR(255),
       sku_woo VARCHAR(255),
-      motivo VARCHAR(80),
+      motivo VARCHAR(255),
       detectado_en DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
   // Por si la tabla ya existía sin la columna de motivo
-  try { await portalPool.query(`ALTER TABLE sync_sku_alertas ADD COLUMN motivo VARCHAR(80)`); } catch (e) {}
+  try { await portalPool.query(`ALTER TABLE sync_sku_alertas ADD COLUMN motivo VARCHAR(255)`); } catch (e) {}
+  // Ensancha 'motivo' en bases antiguas donde se creó como VARCHAR(80): un mensaje
+  // de error largo (p. ej. un error de red/TLS) desbordaba la columna y tumbaba la
+  // corrida con "Data too long for column 'motivo'".
+  try { await portalPool.query(`ALTER TABLE sync_sku_alertas MODIFY motivo VARCHAR(255)`); } catch (e) {}
   // Detalle de la última corrida: lo que VARIÓ y lo que realmente se ACTUALIZÓ,
   // con valores antes/después. Se vacía y se rellena en cada corrida.
   await portalPool.query(`
@@ -454,7 +458,8 @@ async function validarSkuVariaciones(wc, padre, lote) {
 function motivoEscritura(msg) {
   const m = String(msg || '');
   if (/invalid.?id|no v[aá]lido|not\s*found|404|does not exist|no existe|resource/i.test(m)) return 'ID no existe en la web';
-  return 'Error al escribir: ' + m.slice(0, 100);
+  // Acotado para no desbordar la columna 'motivo' (VARCHAR(255)) aunque el error sea largo.
+  return ('Error al escribir: ' + m).slice(0, 200);
 }
 
 // Guarda las NO-sincronizadas (con su motivo) en la base del portal (reemplaza las anteriores).
