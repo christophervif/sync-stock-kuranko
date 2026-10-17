@@ -465,7 +465,13 @@ function motivoEscritura(msg) {
 // Guarda las NO-sincronizadas (con su motivo) en la base del portal (reemplaza las anteriores).
 // Motivos: 'SKU no coincide' | 'ID no existe en la web' | 'Error al escribir: …' | 'No existe en el ERP'
 async function guardarDiscrepancias(portalPool, discrepancias) {
-  await portalPool.query('DELETE FROM sync_sku_alertas'); // cada corrida refresca la lista
+  // Refresca las alertas de stock/precio/SKU, pero NO borra las de imagen
+  // ('Imagen del ERP no accesible' / 'Error al subir imagen'): esas las administra
+  // la fase de imágenes, para que no desaparezcan en corridas donde no corrió.
+  await portalPool.query(
+    `DELETE FROM sync_sku_alertas
+      WHERE motivo IS NULL
+         OR motivo NOT IN ('Imagen del ERP no accesible', 'Error al subir imagen')`);
   if (!discrepancias.length) return;
   // variation_id es PK: para las filas sin variación real (0) usamos ids negativos únicos
   let neg = -1;
