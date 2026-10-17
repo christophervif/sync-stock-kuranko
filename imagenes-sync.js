@@ -9,9 +9,11 @@
 //    · El link se valida ANTES de mandarlo a WooCommerce (HEAD/GET liviano desde
 //      el puente, que tiene mejor red). Los links muertos NO se envían a la web,
 //      así WooCommerce no se cuelga intentando descargar algo que no existe.
-//    · Se procesa de a UNO, con pausas y un TOPE de escrituras por corrida (MAX).
-//    · Los que fallan se guardan como alerta en "Alertas de vinculación" y no se
-//      reintentan hasta pasados REINTENTO_FAIL_DIAS días (para no saturar).
+//    · Se procesa de a UNO, con pausas y un TOPE POR TIEMPO (minutos) por corrida;
+//      lo que no alcanza continúa en la siguiente. El tope por cantidad es solo red.
+//    · Si WooCommerce falla, se reintenta DENTRO de la corrida (errores transitorios).
+//    · Lo que falla queda en "Alertas de vinculación"; los errores de WooCommerce se
+//      reintentan pronto (al día siguiente) y los links que no abren esperan más.
 //    · Memoria en sync_imagenes_estado: lo que ya quedó OK no se vuelve a tocar.
 //
 //  Reutiliza el catálogo web que ya leyó pendientes-web.js (webAll), así que NO
@@ -175,12 +177,22 @@ const diasDesde = (fecha) => fecha ? (Date.now() - new Date(fecha).getTime()) / 
 
 async function sincronizarImagenes({
   prodPool, portalPool, wc, DRY_RUN = false, webAll,
-  MAX = parseInt(process.env.IMG_MAX_POR_CORRIDA || '25', 10),
-  MAX_PADRES = parseInt(process.env.IMG_MAX_PADRES || '15', 10),
-  PAUSA = parseInt(process.env.IMG_PAUSA_MS || '900', 10),
-  PAUSA_LINK = parseInt(process.env.IMG_PAUSA_LINK_MS || '300', 10),
-  LINK_TIMEOUT = parseInt(process.env.IMG_LINK_TIMEOUT_MS || '8000', 10),
-  REINTENTO_FAIL_DIAS = parseInt(process.env.IMG_REINTENTO_FAIL_DIAS || '7', 10),
+  // Tope por TIEMPO (lo normal): la fase trabaja hasta agotar estos minutos y el
+  // resto continúa la próxima corrida. Pensado para la ventana 2am–6am.
+  TIEMPO_MAX_MIN = parseInt(process.env.IMG_TIEMPO_MAX_MIN || '210', 10),
+  // Tope por cantidad: red de seguridad, alto a propósito (manda el tiempo).
+  MAX = parseInt(process.env.IMG_MAX_POR_CORRIDA || '2000', 10),
+  MAX_PADRES = parseInt(process.env.IMG_MAX_PADRES || '600', 10),
+  PAUSA = parseInt(process.env.IMG_PAUSA_MS || '1000', 10),
+  PAUSA_LINK = parseInt(process.env.IMG_PAUSA_LINK_MS || '200', 10),
+  LINK_TIMEOUT = parseInt(process.env.IMG_LINK_TIMEOUT_MS || '6000', 10),
+  // Reintentos DENTRO de la misma corrida cuando WooCommerce falla (transitorios).
+  REINTENTOS = parseInt(process.env.IMG_REINTENTOS || '2', 10),
+  REINTENTO_PAUSA = parseInt(process.env.IMG_REINTENTO_PAUSA_MS || '4000', 10),
+  // Reintento ENTRE corridas: errores de WooCommerce se reintentan pronto (suelen ser
+  // transitorios); links que no abren esperan más (no cambian de un día a otro).
+  REINTENTO_WC_DIAS = parseInt(process.env.IMG_REINTENTO_WC_DIAS || '1', 10),
+  REINTENTO_LINK_DIAS = parseInt(process.env.IMG_REINTENTO_LINK_DIAS || '7', 10),
   REINSPECT_DIAS = parseInt(process.env.IMG_REINSPECT_DIAS || '7', 10)
 } = {}) {
   console.log('\n──────────── FASE IMÁGENES (rellenar solo lo que falta en la web) ────────────');
@@ -195,6 +207,29 @@ async function sincronizarImagenes({
   const registros = [];  // → sync_imagenes_estado
   let intentos = 0;      // cuenta escrituras a WooCommerce (lo pesado)
 
+  // Tope por tiempo: dejamos de EMPEZAR trabajo nuevo pasados los minutos del cupo.
+  const t0 = Date.now();
+  const limiteMs = Math.max(1, TIEMPO_MAX_MIN) * 60000;
+  const tiempoAgotado = () => (Date.now() - t0) > limiteMs;
+  const parar = () => intentos >= MAX || tiempoAgotado();
+
+  // ¿Cuántos días hay que esperar antes de reintentar un fallo, según su tipo?
+  //  · fail_link (el link no abre) → espera larga (no cambia de un día a otro).
+  //  · fail_wc / fail (error de WooCommerce) → corta (suele ser transitorio).
+  const ventanaFail = (estado) => estado === 'fail_link' ? REINTENTO_LINK_DIAS : REINTENTO_WC_DIAS;
+  const enEspera = (mem) => mem && String(mem.estado || '').startsWith('fail') &&
+    diasDesde(mem.intento_en) < ventanaFail(mem.estado);
+
+  // PUT a WooCommerce con reintentos (para 400/5xx/caídas de red transitorias).
+  const putReintento = async (url, body) => {
+    let ultimo;
+    for (let i = 0; i <= REINTENTOS; i++) {
+      try { return await wc.put(url, body); }
+      catch (e) { ultimo = e; if (i < REINTENTOS) await pausa(REINTENTO_PAUSA); }
+    }
+    throw ultimo;
+  };
+
   // ── 1) Nivel producto: simples y padres variables con galería vacía en la web ──
   const prodCand = webAll.filter(p =>
     (p.type === 'simple' || p.type === 'variable') &&
@@ -208,11 +243,11 @@ async function sincronizarImagenes({
     const nivel = esPadre ? 'padre' : 'simple';
     const mem = memoria.get(clave);
     if (mem && mem.estado === 'ok') continue;                         // ya resuelto
-    if (mem && mem.estado === 'fail' && diasDesde(mem.intento_en) < REINTENTO_FAIL_DIAS) {
-      alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: mem.detalle }); // sigue visible, sin reintentar
+    if (enEspera(mem)) {
+      alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: mem.detalle }); // sigue visible, sin reintentar aún
       continue;
     }
-    if (intentos >= MAX) break;
+    if (parar()) break;
 
     const erp = erpProd.get((cand.sku || '').trim().toLowerCase());
     if (!erp) continue;                                              // no está en el ERP → sin imágenes que subir
@@ -229,23 +264,23 @@ async function sincronizarImagenes({
     if (!vivos.length) {
       const det = `Link(s) del ERP no accesibles (${muertos.length})`;
       alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Imagen del ERP no accesible', detalle: (urls[0] || det).slice(0, 255) });
-      registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail', detalle: det });
+      registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail_link', detalle: det });
       await pausa(PAUSA); continue;
     }
     try {
-      const { data } = await wc.put(`/products/${cand.id}`, { images: vivos.map(u => ({ src: u })) });
+      const { data } = await putReintento(`/products/${cand.id}`, { images: vivos.map(u => ({ src: u })) });
       if (data && Array.isArray(data.images) && data.images.length > 0) {
         registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'ok', detalle: `${data.images.length} imagen(es)`, n: data.images.length });
         console.log(`   ✓ ${nivel} ${cand.sku} (wc ${cand.id}): ${data.images.length} imagen(es).`);
       } else {
         const det = 'WooCommerce no guardó las imágenes';
         alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: det });
-        registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail', detalle: det });
+        registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail_wc', detalle: det });
       }
     } catch (e) {
       const det = e.response ? `HTTP ${e.response.status}` : (e.message || 'error');
       alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: det.slice(0, 255) });
-      registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail', detalle: det.slice(0, 255) });
+      registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail_wc', detalle: det.slice(0, 255) });
       console.log(`   ✗ ${nivel} ${cand.sku} (wc ${cand.id}): ${det}`);
     }
     await pausa(PAUSA);
@@ -255,7 +290,7 @@ async function sincronizarImagenes({
   let padresInsp = 0;
   const padresWeb = webAll.filter(p => p.type === 'variable' && p.id);
   for (const padre of padresWeb) {
-    if (intentos >= MAX || padresInsp >= MAX_PADRES) break;
+    if (parar() || padresInsp >= MAX_PADRES) break;
     const claveP = 'vp' + padre.id;
     const memP = memoria.get(claveP);
     if (memP && diasDesde(memP.intento_en) < REINSPECT_DIAS) continue; // inspeccionado hace poco
@@ -281,11 +316,11 @@ async function sincronizarImagenes({
 
     const erpV = await imagenesErpDeSkus(prodPool, [...new Set(vacias.map(v => v.sku.toLowerCase()))]);
     for (const v of vacias) {
-      if (intentos >= MAX) break;
+      if (parar()) break;
       const clave = 'v' + v.id;
       const mem = memoria.get(clave);
       if (mem && mem.estado === 'ok') continue;
-      if (mem && mem.estado === 'fail' && diasDesde(mem.intento_en) < REINTENTO_FAIL_DIAS) {
+      if (enEspera(mem)) {
         alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: mem.detalle });
         continue;
       }
@@ -297,23 +332,23 @@ async function sincronizarImagenes({
       const { vivos } = await filtrarVivos(urls.slice(0, 1), LINK_TIMEOUT, PAUSA_LINK); // la variación toma 1 imagen
       if (!vivos.length) {
         alertas.push({ wc: v.id, sku: v.sku, motivo: 'Imagen del ERP no accesible', detalle: (urls[0] || '').slice(0, 255) });
-        registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail', detalle: 'link no accesible' });
+        registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail_link', detalle: 'link no accesible' });
         await pausa(PAUSA); continue;
       }
       try {
-        const { data } = await wc.put(`/products/${padre.id}/variations/${v.id}`, { image: { src: vivos[0] } });
+        const { data } = await putReintento(`/products/${padre.id}/variations/${v.id}`, { image: { src: vivos[0] } });
         if (data && data.image && data.image.src) {
           registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'ok', detalle: '1 imagen', n: 1 });
           console.log(`   ✓ variación ${v.sku} (wc ${v.id}): 1 imagen.`);
         } else {
           const det = 'WooCommerce no guardó la imagen';
           alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: det });
-          registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail', detalle: det });
+          registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail_wc', detalle: det });
         }
       } catch (e) {
         const det = e.response ? `HTTP ${e.response.status}` : (e.message || 'error');
         alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: det.slice(0, 255) });
-        registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail', detalle: det.slice(0, 255) });
+        registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail_wc', detalle: det.slice(0, 255) });
         console.log(`   ✗ variación ${v.sku} (wc ${v.id}): ${det}`);
       }
       await pausa(PAUSA);
@@ -329,8 +364,9 @@ async function sincronizarImagenes({
 
   const subidas = exitos.length;
   const fallidas = alertas.length;
-  console.log(`   RESULTADO imágenes: ${subidas} subidas, ${fallidas} con alerta (tope ${MAX} por corrida).`);
-  if (intentos >= MAX) console.log('   (Se alcanzó el tope de la corrida; el resto continúa en la próxima.)');
+  const mins = Math.round((Date.now() - t0) / 60000);
+  console.log(`   RESULTADO imágenes: ${subidas} subidas, ${fallidas} con alerta — ${intentos} intentos en ${mins} min (cupo ${TIEMPO_MAX_MIN} min).`);
+  if (parar()) console.log('   (Se alcanzó el cupo de la corrida; el resto continúa en la próxima.)');
   return { subidas, fallidas };
 }
 
