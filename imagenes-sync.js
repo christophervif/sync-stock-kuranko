@@ -151,6 +151,10 @@ async function imagenesErpDeSkus(prodPool, skus) {
 // para la hoja "Alertas de vinculación". Usa ids negativos para no chocar con las
 // alertas de la fase de stock/precio.
 async function guardarAlertasImg(portalPool, alertas) {
+  // Auto-administra SOLO las filas de imagen: las borra y reinserta cada vez que
+  // corre la fase, así no se duplican ni dependen de que la fase de stock limpie.
+  await portalPool.query(
+    `DELETE FROM sync_sku_alertas WHERE motivo IN ('Imagen del ERP no accesible', 'Error al subir imagen')`);
   if (!alertas.length) return;
   let neg = -3000000;
   const valores = alertas.map(a => [neg--, a.wc || 0, a.sku || '', (a.detalle || '').slice(0, 255), a.motivo || 'Error al subir imagen']);
