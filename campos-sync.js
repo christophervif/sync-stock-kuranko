@@ -92,7 +92,10 @@ const CAMPOS_VAR = ['backorders', 'weight', 'length', 'width', 'height'];
 const CAMPOS_PADRE = ['name', 'publicado', 'featured', 'visibility', 'short_description', 'categorias', 'etiquetas'];
 
 async function guardarDetalleCampos(portalPool, filas) {
-  await portalPool.query('DELETE FROM sync_detalle_campos');
+  // Limpia solo las filas de campos ricos; NO toca las de imágenes ('Imágenes'),
+  // que las administra la fase de imágenes (que corre en otra cadencia). Así el
+  // reporte no pierde las imágenes en corridas donde esa fase no se ejecutó.
+  await portalPool.query(`DELETE FROM sync_detalle_campos WHERE campo <> 'Imágenes'`);
   if (!filas.length) return;
   // Insertar en tandas para no exceder el tamaño de paquete
   const CH = 500;
