@@ -311,7 +311,13 @@ async function leerProductosERP(prodPool) {
   const [rows] = await prodPool.query(
     `SELECT pv.id AS variation_id,
             pv.woocommerce_id AS wc_id,
-            p.woocommerce_id AS wc_padre,
+            COALESCE(
+              (SELECT vp.woocommerce_id FROM product_variations vp
+                WHERE vp.product_id = p.id AND vp.product_type = 'variable'
+                  AND vp.deleted_at IS NULL
+                ORDER BY vp.id LIMIT 1),
+              p.woocommerce_id
+            ) AS wc_padre,
             pv.product_type,
             pv.sku,
             pv.regular_price,
@@ -323,7 +329,7 @@ async function leerProductosERP(prodPool) {
      WHERE pv.woocommerce_id IS NOT NULL
        AND pv.product_type IN ('variation','simple')
        AND pv.deleted_at IS NULL
-     GROUP BY pv.id, pv.woocommerce_id, p.woocommerce_id, pv.product_type, pv.sku, pv.regular_price, pv.sale_price
+     GROUP BY pv.id, p.id, pv.woocommerce_id, p.woocommerce_id, pv.product_type, pv.sku, pv.regular_price, pv.sale_price
      ORDER BY pv.id`
   );
   return rows;
