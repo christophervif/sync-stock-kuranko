@@ -142,7 +142,14 @@ async function leerEtiquetasErp(prodPool, prodIds) {
 async function leerDatosRicos(prodPool) {
   const [rows] = await prodPool.query(
     `SELECT pv.id AS variation_id, pv.woocommerce_id AS wc_id,
-            p.id AS product_id, p.woocommerce_id AS wc_padre,
+            p.id AS product_id,
+            COALESCE(
+              (SELECT vp.woocommerce_id FROM product_variations vp
+                WHERE vp.product_id = p.id AND vp.product_type = 'variable'
+                  AND vp.deleted_at IS NULL
+                ORDER BY vp.id LIMIT 1),
+              p.woocommerce_id
+            ) AS wc_padre,
             pv.product_type, pv.sku, pv.status,
             pv.weight, pv.length, pv.width, pv.height,
             pvs.backorder_mode AS backorder_mode,
