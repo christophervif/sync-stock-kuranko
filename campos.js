@@ -6,11 +6,16 @@ function backordersWoo(mode){
   return (mode === 'notify' || mode === 'yes') ? 'notify' : 'no';
 }
 
+// ERP en Borrador o Descontinuada -> el producto se esconde por completo en la web
+function esInactivoErp(statusErp){
+  return statusErp === 'draft' || statusErp === 'discontinued';
+}
+
 // Publicado final (WooCommerce status): 'publish' | 'private'
-//  fórmula: si stock>0 -> 1(publish); si no -> -1(private) solo si discontinued, si no 1(publish)
+//  Borrador o Descontinuada (con o sin stock) -> 'private' (Visibilidad: Privada).
+//  Activa -> 'publish' (Visibilidad: Pública).
 function publicadoWoo(stock, statusErp){
-  const val = (stock > 0) ? 1 : (statusErp === 'discontinued' ? -1 : 1);
-  return val === 1 ? 'publish' : (val === -1 ? 'private' : 'draft');
+  return esInactivoErp(statusErp) ? 'private' : 'publish';
 }
 
 // Visibilidad final: 'visible' | 'hidden'
@@ -25,6 +30,8 @@ function statusAExportPub(statusErp){
 function visibilidadWoo(stock, statusErp, backordersFinal, nombre){
   const pubErp = statusAExportPub(statusErp);
   const tienePCK = /PCK/.test(String(nombre||''));
+  // Borrador o Descontinuada: siempre oculto, aunque tenga reservas ("A pedido")
+  if (esInactivoErp(statusErp)) return 'hidden';
   if (backordersFinal === 'notify') return 'visible';
   if (pubErp === -1 || pubErp === 0 || tienePCK) return 'hidden';
   return stock > 0 ? 'visible' : 'hidden';
