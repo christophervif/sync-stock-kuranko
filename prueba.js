@@ -8,7 +8,7 @@
  *  - Solo procesa 20 productos (LIMIT 20), para validar sin riesgo.
  *  - Identifica cada producto ÚNICAMENTE por su woocommerce_id.
  *  - Pausas cortas entre llamadas para no saturar el hosting.
- *  - Si una fila no tiene woocommerce_id, se ignora (nunca se crea nada).
+ *  - Si una fila no tiene woocommerce_id, se ignora (nunca se crea nada). 
  *  - NO crea productos. NO borra nada. Solo actualiza el número de stock.
  *
  * Variables de entorno necesarias (se configuran en Railway):
