@@ -10,6 +10,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 const C = require('./campos');
 const { crearResolvedorTaxonomia } = require('./campos-tax');
+const { ubicacionesExcluidas } = require('./stock-ubicaciones');
 
 // HTML "Pronto en stock / A pedido" (de la pestaña Info: C2 simple, C4 variable)
 const HTML_SIMPLE = "<div id=\"wcapf-active-filters-1\" class=\"woocommerce wcapf-ajax-term-filter widget cf widget_wcapf-active-filters\"><strong><a data-key=\"attra-disponibilidad\" data-value=\"352\" data-multiple-filter=\"\"><span class=\"name\"><font color=\"#E84E0E\">Disponible A PEDIDO.                                        </font></span></a></strong></div>\n<div id=\"wcapf-attribute-filter-6\" class=\"woocommerce wcapf-ajax-term-filter widget cf widget_wcapf-attribute-filter\">\n<div class=\"wcapf-layered-nav et-list-wcapf ps ps--theme_default\" data-ps-id=\"7946ef68-653f-c20b-c5f3-9a8737d12d7d\">\n\n<strong><span class=\"name\">El tiempo de espera es de 2 a 3 semanas. Consultar <a href=\"http://wa.me/51963358335\" target=\"_blank\" rel=\"noopener\"><u>AQUÍ</u></a> para confirmar y/o información más detallada.</span></strong>\n\n<strong><span class=\"name\">Usar código APEDIDO para obtener el descuento de 50% de adelanto y el 50% restante se realiza en la entrega.</span></strong>\n<strong><span class=\"name\">Para compras A pedido <u>SOLO</u> se aceptan <u>pagos con transferencia</u>.</span></strong>\n\n&nbsp;\n\n</div>\n</div>";
@@ -159,12 +160,13 @@ async function leerDatosRicos(prodPool) {
        JOIN products p ON p.id = pv.product_id
        LEFT JOIN product_variation_stocks pvs ON pvs.product_variation_id = pv.id
        LEFT JOIN location_stocks ls ON ls.product_variation_id = pv.id
+        AND ls.location_id NOT IN (?)   -- sin CUARENTENA ni EMBAJADOR (stock-ubicaciones.js)
       WHERE pv.woocommerce_id IS NOT NULL
         AND pv.product_type IN ('variation','simple')
         AND pv.deleted_at IS NULL
       GROUP BY pv.id, pv.woocommerce_id, p.id, p.woocommerce_id, pv.product_type,
                pv.sku, pv.status, pv.weight, pv.length, pv.width, pv.height,
-               pvs.backorder_mode, p.name, p.is_featured`);
+               pvs.backorder_mode, p.name, p.is_featured`, [await ubicacionesExcluidas(prodPool)]);
   return rows;
 }
 

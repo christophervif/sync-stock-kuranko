@@ -35,6 +35,7 @@ const mysql = require('mysql2/promise');
 const axios = require('axios');
 const { sincronizarCamposRicos } = require('./campos-sync');
 const { recolectarPendientesWeb } = require('./pendientes-web');
+const { ubicacionesExcluidas } = require('./stock-ubicaciones');
 const { sincronizarImagenes } = require('./imagenes-sync');
 // Activa/desactiva la fase de campos ricos (nombre, publicado, visibilidad, etc.)
 const SYNC_CAMPOS = process.env.SYNC_CAMPOS !== 'false'; // por defecto activada
@@ -326,11 +327,12 @@ async function leerProductosERP(prodPool) {
      FROM product_variations pv
      JOIN products p ON p.id = pv.product_id
      LEFT JOIN location_stocks ls ON ls.product_variation_id = pv.id
+           AND ls.location_id NOT IN (?)   -- sin CUARENTENA ni EMBAJADOR (stock-ubicaciones.js)
      WHERE pv.woocommerce_id IS NOT NULL
        AND pv.product_type IN ('variation','simple')
        AND pv.deleted_at IS NULL
      GROUP BY pv.id, p.id, pv.woocommerce_id, p.woocommerce_id, pv.product_type, pv.sku, pv.regular_price, pv.sale_price
-     ORDER BY pv.id`
+     ORDER BY pv.id`, [await ubicacionesExcluidas(prodPool)]
   );
   return rows;
 }
@@ -345,11 +347,12 @@ async function leerPendientesERP(prodPool) {
      FROM product_variations pv
      JOIN products p ON p.id = pv.product_id
      LEFT JOIN location_stocks ls ON ls.product_variation_id = pv.id
+           AND ls.location_id NOT IN (?)   -- sin CUARENTENA ni EMBAJADOR (stock-ubicaciones.js)
      WHERE pv.woocommerce_id IS NULL
        AND pv.product_type IN ('variation','simple')
        AND pv.deleted_at IS NULL
      GROUP BY pv.id, pv.sku, pv.product_type, p.name, pv.name, pv.regular_price
-     ORDER BY p.name, pv.sku`
+     ORDER BY p.name, pv.sku`, [await ubicacionesExcluidas(prodPool)]
   );
   return rows;
 }
