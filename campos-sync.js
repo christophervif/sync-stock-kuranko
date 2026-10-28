@@ -5,6 +5,10 @@
 //   · Variación/simple: reservas (backorders), peso, largo, ancho, alto.
 //   · Producto padre/simple: nombre, publicado(status), destacado, visibilidad,
 //     descripción corta.  (Categorías y etiquetas = Fase 2.)
+//  ACTUALIZACIÓN COMPLETA (solicitud del portal o FORZAR_TODO): se reenvían TODOS los
+//  campos de todos los productos, aunque la memoria diga que no cambiaron.
+//  COLA DE SKUs: se reenvían los campos de esos SKUs (la variación/simple y su producto;
+//  si el SKU es un padre variable, también todas sus variaciones).
 //  NO crea ni borra nada. Respeta DRY_RUN. Reglas idénticas al Excel del usuario
 //  (ver campos.js, validado al 100%).
 // ═══════════════════════════════════════════════════════════════════════════
@@ -306,11 +310,25 @@ function detWC(e) {
 }
 
 // ─── Orquestador de la fase ─────────────────────────────────────────────────
-async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE = 50, PAUSA = 16000, PAUSA_ITEM = 700 }) {
+async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE = 50, PAUSA = 16000, PAUSA_ITEM = 700,
+                                        FORZAR = false, SKUS_COLA = new Set() }) {
   console.log('\n──────────── FASE CAMPOS RICOS (nombre, publicado, visibilidad, etc.) ────────────');
   await prepararTablasCampos(portalPool);
   const rows = await leerDatosRicos(prodPool);
   console.log(`   ${rows.length} variaciones/simples en la web.`);
+
+  // Qué se fuerza (se envía aunque la memoria diga que no cambió)
+  const pidsCola = new Set(), pidsPadreCola = new Set();
+  if (!FORZAR && SKUS_COLA.size) {
+    const [q] = await prodPool.query(
+      `SELECT product_id, product_type FROM product_variations
+        WHERE deleted_at IS NULL AND LOWER(TRIM(sku)) IN (?)`, [[...SKUS_COLA]]);
+    q.forEach(r => { pidsCola.add(r.product_id); if (r.product_type === 'variable') pidsPadreCola.add(r.product_id); });
+  }
+  const forzarVar = (r) => FORZAR || SKUS_COLA.has(String(r.sku || '').trim().toLowerCase()) || pidsPadreCola.has(r.product_id);
+  const forzarPadre = (pid) => FORZAR || pidsCola.has(pid);
+  if (FORZAR) console.log('   *** ACTUALIZACIÓN COMPLETA: se reenvían los campos de TODOS los productos ***');
+  else if (pidsCola.size) console.log(`   Cola de SKUs: se reenvían los campos de ${pidsCola.size} producto(s).`);
 
   const memVar = await leerMemoriaVar(portalPool);
   const memPadre = await leerMemoriaPadre(portalPool);
@@ -326,7 +344,7 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
   for (const r of rows) {
     const campos = calcularVariacion(r);
     const diffs = diffCampos(campos, memVar[r.variation_id], CAMPOS_VAR);
-    if (diffs.length) varCambiadas.push({ ...r, campos, _diffs: diffs });
+    if (diffs.length || forzarVar(r)) varCambiadas.push({ ...r, campos, _diffs: diffs });
   }
   // 2) Detectar padres/simples cuyos campos cambiaron (incluye categorías y etiquetas)
   const padres = calcularPadres(rows, catMap, tagMap);
@@ -334,7 +352,9 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
   for (const [pid, info] of padres) {
     const prev = memPadre[pid];
     const diffs = diffCampos(info.campos, prev, CAMPOS_PADRE);
-    if (diffs.length) padreCambiado.push({ product_id: pid, ...info, prev, _diffs: diffs });
+    // Forzado: prev vacío → también se reenvían categorías y etiquetas (nunca vacías: ver abajo)
+    if (forzarPadre(pid)) padreCambiado.push({ product_id: pid, ...info, prev: {}, _diffs: diffs });
+    else if (diffs.length) padreCambiado.push({ product_id: pid, ...info, prev, _diffs: diffs });
   }
   console.log(`   Cambios detectados: ${varCambiadas.length} variaciones, ${padreCambiado.length} productos (nivel padre).`);
 

@@ -213,6 +213,28 @@ async function leerColaSku(portalPool) {
   } catch (e) { return { skus: [], conOferta: new Set() }; }
 }
 
+// SKUs de productos PADRE (variables) en la cola: agrega a la cola los SKUs de todas sus
+// variaciones (heredan "actualizar oferta" del padre). Devuelve el Set de padres encontrados.
+async function expandirPadresCola(prodPool, cola) {
+  const padres = new Set();
+  if (!cola.skus.length) return padres;
+  const [rows] = await prodPool.query(
+    `SELECT LOWER(TRIM(vp.sku)) AS psku, TRIM(pv.sku) AS sku
+       FROM product_variations vp
+       JOIN product_variations pv ON pv.product_id = vp.product_id AND pv.product_type = 'variation' AND pv.deleted_at IS NULL
+      WHERE vp.product_type = 'variable' AND vp.deleted_at IS NULL
+        AND LOWER(TRIM(vp.sku)) IN (?) AND TRIM(pv.sku) <> ''`, [cola.skus.map(x => x.toLowerCase())]);
+  const ya = new Set(cola.skus.map(x => x.toLowerCase()));
+  rows.forEach(r => {
+    padres.add(r.psku);
+    const sk = r.sku.toLowerCase();
+    if (!ya.has(sk)) { cola.skus.push(r.sku); ya.add(sk); }
+    if (cola.conOferta.has(r.psku)) cola.conOferta.add(sk);
+  });
+  if (padres.size) console.log(`3b) Cola: ${padres.size} SKU(s) de producto padre → se suman todas sus variaciones.`);
+  return padres;
+}
+
 // Marca toda la cola pendiente como atendida
 async function marcarColaAtendida(portalPool) {
   await portalPool.query(
@@ -536,6 +558,8 @@ async function main() {
     // 3b. Sumar los SKUs de la cola manual (pegados desde el portal).
     // Se fuerzan aunque no hayan cambiado; se deduplican por variation_id.
     const cola = await leerColaSku(portalPool);
+    // Un SKU de producto PADRE (variable) en la cola fuerza todas sus variaciones.
+    const padresEnCola = await expandirPadresCola(prodPool, cola);
     const colaSku = cola.skus;
     let skusNoEncontrados = [];
     if (colaSku.length) {
@@ -547,7 +571,7 @@ async function main() {
         setSku.has((p.sku || '').trim().toLowerCase()) && !yaIncluidos.has(p.variation_id));
       // Detectar cuáles SKUs pegados no existen en el ERP (para Alertas)
       const skusEncontrados = new Set(productos.map(p => (p.sku || '').trim().toLowerCase()));
-      skusNoEncontrados = colaSku.filter(s => !skusEncontrados.has(s.toLowerCase()));
+      skusNoEncontrados = colaSku.filter(s => !skusEncontrados.has(s.toLowerCase()) && !padresEnCola.has(s.toLowerCase()));
       // Agregar los forzados. Marca oferta si su tanda lo pidió.
       forzadosPorSku.forEach(p => {
         const skuLow = (p.sku || '').trim().toLowerCase();
@@ -771,7 +795,9 @@ async function main() {
       try {
         await sincronizarCamposRicos({
           prodPool, portalPool, wc, DRY_RUN,
-          LOTE: LOTE_SIZE, PAUSA: PAUSA_LOTE_MS, PAUSA_ITEM: PAUSA_ITEM_MS
+          LOTE: LOTE_SIZE, PAUSA: PAUSA_LOTE_MS, PAUSA_ITEM: PAUSA_ITEM_MS,
+          // Actualización completa → todos; cola de SKUs → esos SKUs (aunque no hayan cambiado)
+          FORZAR: forzar, SKUS_COLA: new Set(colaSku.map(x => x.trim().toLowerCase()))
         });
       } catch (e) {
         console.error('   ✗ Error en la fase de campos ricos:', e.message);
@@ -785,13 +811,16 @@ async function main() {
         const rweb = await recolectarPendientesWeb({
           prodPool, portalPool, wc,
           PAUSA_ITEM: PAUSA_ITEM_MS, REFRESH_H: PENDIENTES_WEB_REFRESH_H,
-          FORCE: process.env.PENDIENTES_WEB_FORCE === 'true'
+          // Actualización completa (portal o FORZAR_TODO): la recolección y las imágenes corren sí o sí
+          FORCE: process.env.PENDIENTES_WEB_FORCE === 'true' || forzar || colaSku.length > 0
         });
         // 5d. FASE IMÁGENES (aditiva): rellena en la web solo lo que no tiene imagen,
         //     reutilizando el catálogo web (webAll) que acaba de leer la recolección.
+        if (SYNC_IMAGENES && rweb && !rweb.webAll && !rweb.omitido) console.log('   (Fase de imágenes omitida: la recolección no leyó el catálogo web.)');
         if (SYNC_IMAGENES && rweb && rweb.webAll) {
           try {
-            await sincronizarImagenes({ prodPool, portalPool, wc, DRY_RUN, webAll: rweb.webAll });
+            await sincronizarImagenes({ prodPool, portalPool, wc, DRY_RUN, webAll: rweb.webAll, FORZAR: forzar,
+              SKUS_COLA: new Set(colaSku.map(x => x.trim().toLowerCase())) });
           } catch (e) { console.error('   ✗ Error en la fase de imágenes:', e.message); }
         }
       } catch (e) { console.error('   ✗ Error recolectando "productos sin ID":', e.message); }

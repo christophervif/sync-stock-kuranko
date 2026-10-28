@@ -14,7 +14,14 @@
 //    · Si WooCommerce falla, se reintenta DENTRO de la corrida (errores transitorios).
 //    · Lo que falla queda en "Alertas de vinculación"; los errores de WooCommerce se
 //      reintentan pronto (al día siguiente) y los links que no abren esperan más.
-//    · Memoria en sync_imagenes_estado: lo que ya quedó OK no se vuelve a tocar.
+//    · Memoria en sync_imagenes_estado (intentos y fallos). Si la web sigue sin
+//      imagen, se vuelve a intentar aunque antes haya quedado OK.
+//    · ACTUALIZACIÓN COMPLETA (solicitud del portal o FORZAR_TODO): revisa TODOS los
+//      padres variables y reintenta los fallos sin esperar su ventana.
+//    · COLA DE SKUs ("Sincronizar SKUs específicos"): esos SKUs se revisan en esta
+//      corrida (sus padres aunque se hayan revisado hace poco) y reintentan sus fallos.
+//    · Censo en sync_imagenes_faltan: SKUs que NO tienen imagen en la web pero SÍ en
+//      el ERP, con el motivo. Lo lee el portal (hoja "Sin imagen en la web").
 //
 //  Reutiliza el catálogo web que ya leyó pendientes-web.js (webAll), así que NO
 //  vuelve a leer la tienda. Corre en la misma cadencia que esa recolección.
@@ -32,6 +39,19 @@ async function prepararTabla(portalPool) {
       estado VARCHAR(10),
       detalle VARCHAR(255),
       intento_en DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+  // Censo: sin imagen en la web pero con imagen en el ERP (lo lee el portal).
+  await portalPool.query(`
+    CREATE TABLE IF NOT EXISTS sync_imagenes_faltan (
+      clave VARCHAR(40) PRIMARY KEY,
+      sku VARCHAR(255),
+      woocommerce_id BIGINT,
+      padre_wc BIGINT NULL,
+      nivel VARCHAR(20),
+      imgs_erp INT,
+      situacion VARCHAR(255),
+      revisado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX (padre_wc)
     )`);
   // Misma tabla de detalle que usa la fase de campos ricos. Aquí escribimos las
   // imágenes subidas como una fila más (campo "Imágenes"), para que salgan en la
@@ -134,7 +154,7 @@ async function imagenesErpDeSkus(prodPool, skus) {
   imgs.forEach(im => {
     if (!im.path || im.pid == null) return;
     (galeria[im.pid] = galeria[im.pid] || []).push(im.path);
-    if (im.product_variation_id != null) (byVar[im.product_variation_id] = byVar[im.product_variation_id] || []).push(im.path);
+    if (im.vid != null) (byVar[im.vid] = byVar[im.vid] || []).push(im.path);
     else if (im.nivel_prod) (byProd[im.pid] = byProd[im.pid] || []).push(im.path);
   });
   const dedup = (a) => [...new Set((a || []).filter(Boolean))];
@@ -177,10 +197,39 @@ async function guardarMemoria(portalPool, registros) {
     valores.flat());
 }
 
+// Censo "sin imagen en la web, con imagen en el ERP" (sync_imagenes_faltan):
+//  · nivel producto (simples y padres): se reemplaza entero en cada corrida.
+//  · variaciones: se reemplazan las de los padres revisados en esta corrida; las de
+//    padres que ya no existen en la web se borran; las demás quedan con su fecha.
+async function guardarCenso(portalPool, faltanProd, faltanVar, padresRevisados, padresVivos) {
+  await portalPool.query(`DELETE FROM sync_imagenes_faltan WHERE nivel IN ('simple','padre')`);
+  if (padresRevisados.size) await portalPool.query(
+    `DELETE FROM sync_imagenes_faltan WHERE nivel = 'variacion' AND padre_wc IN (?)`, [[...padresRevisados]]);
+  const [vs] = await portalPool.query(`SELECT DISTINCT padre_wc FROM sync_imagenes_faltan WHERE nivel = 'variacion'`);
+  const muertos = vs.map(r => Number(r.padre_wc)).filter(id => !padresVivos.has(id));
+  if (muertos.length) await portalPool.query(`DELETE FROM sync_imagenes_faltan WHERE nivel = 'variacion' AND padre_wc IN (?)`, [muertos]);
+  const filas = [...faltanProd, ...faltanVar];
+  for (let i = 0; i < filas.length; i += 500) {
+    const t = filas.slice(i, i + 500);
+    await portalPool.query(
+      `INSERT INTO sync_imagenes_faltan (clave, sku, woocommerce_id, padre_wc, nivel, imgs_erp, situacion, revisado_en)
+       VALUES ${t.map(() => '(?,?,?,?,?,?,?,NOW())').join(',')}
+       ON DUPLICATE KEY UPDATE sku=VALUES(sku), woocommerce_id=VALUES(woocommerce_id), padre_wc=VALUES(padre_wc),
+         nivel=VALUES(nivel), imgs_erp=VALUES(imgs_erp), situacion=VALUES(situacion), revisado_en=NOW()`,
+      t.flatMap(f => [f.clave, f.sku || '', f.wc || 0, f.padre, f.nivel, f.n || 0, String(f.situacion || '').slice(0, 255)]));
+  }
+  const [[c]] = await portalPool.query(`SELECT COUNT(*) n FROM sync_imagenes_faltan`);
+  return c.n;
+}
+
 const diasDesde = (fecha) => fecha ? (Date.now() - new Date(fecha).getTime()) / 86400000 : Infinity;
 
 async function sincronizarImagenes({
   prodPool, portalPool, wc, DRY_RUN = false, webAll,
+  // Actualización completa: revisa todos los padres y reintenta fallos ya.
+  FORZAR = false,
+  // SKUs de la cola manual (Set en minúscula): se fuerzan solo esos.
+  SKUS_COLA = new Set(),
   // Tope por TIEMPO (lo normal): la fase trabaja hasta agotar estos minutos y el
   // resto continúa la próxima corrida. Pensado para la ventana 2am–6am.
   TIEMPO_MAX_MIN = parseInt(process.env.IMG_TIEMPO_MAX_MIN || '210', 10),
@@ -202,6 +251,7 @@ async function sincronizarImagenes({
   console.log('\n──────────── FASE IMÁGENES (rellenar solo lo que falta en la web) ────────────');
   if (DRY_RUN) { console.log('   (DRY_RUN: no se sube ninguna imagen.)'); return { subidas: 0, fallidas: 0 }; }
   if (!Array.isArray(webAll) || !webAll.length) { console.log('   Sin catálogo web disponible; se omite.'); return { subidas: 0, fallidas: 0 }; }
+  if (FORZAR) console.log('   *** ACTUALIZACIÓN COMPLETA: se revisan todos los padres y se reintentan los fallos ***');
 
   await prepararTabla(portalPool);
   const [mrows] = await portalPool.query(`SELECT clave, estado, detalle, intento_en FROM sync_imagenes_estado`);
@@ -221,8 +271,16 @@ async function sincronizarImagenes({
   //  · fail_link (el link no abre) → espera larga (no cambia de un día a otro).
   //  · fail_wc / fail (error de WooCommerce) → corta (suele ser transitorio).
   const ventanaFail = (estado) => estado === 'fail_link' ? REINTENTO_LINK_DIAS : REINTENTO_WC_DIAS;
-  const enEspera = (mem) => mem && String(mem.estado || '').startsWith('fail') &&
+  const enCola = (sku) => SKUS_COLA.has(String(sku || '').trim().toLowerCase());
+  const enEspera = (mem, sku) => !FORZAR && !enCola(sku) && mem && String(mem.estado || '').startsWith('fail') &&
     diasDesde(mem.intento_en) < ventanaFail(mem.estado);
+  const fechaCorta = (f) => f ? new Date(f).toLocaleDateString('es-PE', { timeZone: 'America/Lima', day: '2-digit', month: '2-digit' }) : '';
+  const situacionEspera = (mem) => (mem.estado === 'fail_link' ? 'El link de la imagen no abre' : 'WooCommerce no la aceptó') +
+    ` (${mem.detalle || 'error'}); se reintenta después del ${fechaCorta(new Date(new Date(mem.intento_en).getTime() + ventanaFail(mem.estado) * 86400000))}`;
+  const PENDIENTE = 'Pendiente: no alcanzó el tiempo de esta corrida; sigue en la próxima';
+  const faltanProd = [];   // censo nivel producto (se reemplaza entero)
+  const faltanVar = [];    // censo de variaciones de los padres revisados en esta corrida
+  const padresRevisados = new Set();
 
   // PUT a WooCommerce con reintentos (para 400/5xx/caídas de red transitorias).
   const putReintento = async (url, body) => {
@@ -246,13 +304,7 @@ async function sincronizarImagenes({
     const clave = (esPadre ? 'p' : 's') + cand.id;
     const nivel = esPadre ? 'padre' : 'simple';
     const mem = memoria.get(clave);
-    if (mem && mem.estado === 'ok') continue;                         // ya resuelto
-    if (enEspera(mem)) {
-      alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: mem.detalle }); // sigue visible, sin reintentar aún
-      continue;
-    }
-    if (parar()) break;
-
+    // (Si en la memoria quedó "ok" pero la web sigue sin imagen, se vuelve a intentar.)
     const erp = erpProd.get((cand.sku || '').trim().toLowerCase());
     if (!erp) continue;                                              // no está en el ERP → sin imágenes que subir
     // Padre: galería de producto y, si no tiene, la unión de sus variantes.
@@ -262,6 +314,13 @@ async function sincronizarImagenes({
       : (erp.own.length ? erp.own : (erp.prod.length ? erp.prod : erp.galeria));
     urls = [...new Set((urls || []).filter(Boolean))];
     if (!urls.length) continue;                                     // el ERP tampoco tiene imágenes
+    const falta = (situacion) => faltanProd.push({ clave, sku: cand.sku, wc: cand.id, padre: null, nivel, n: urls.length, situacion });
+    if (enEspera(mem, cand.sku)) {
+      alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: mem.detalle }); // sigue visible, sin reintentar aún
+      falta(situacionEspera(mem));
+      continue;
+    }
+    if (parar()) { falta(PENDIENTE); continue; }
 
     intentos++;
     const { vivos, muertos } = await filtrarVivos(urls, LINK_TIMEOUT, PAUSA_LINK);
@@ -269,6 +328,7 @@ async function sincronizarImagenes({
       const det = `Link(s) del ERP no accesibles (${muertos.length})`;
       alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Imagen del ERP no accesible', detalle: (urls[0] || det).slice(0, 255) });
       registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail_link', detalle: det });
+      falta('El link de la imagen no abre: ' + (urls[0] || ''));
       await pausa(PAUSA); continue;
     }
     try {
@@ -280,11 +340,13 @@ async function sincronizarImagenes({
         const det = 'WooCommerce no guardó las imágenes';
         alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: det });
         registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail_wc', detalle: det });
+        falta(det);
       }
     } catch (e) {
       const det = e.response ? `HTTP ${e.response.status}` : (e.message || 'error');
       alertas.push({ wc: cand.id, sku: cand.sku, motivo: 'Error al subir imagen', detalle: det.slice(0, 255) });
       registros.push({ clave, wc: cand.id, sku: cand.sku, nivel, estado: 'fail_wc', detalle: det.slice(0, 255) });
+      falta('WooCommerce no la aceptó: ' + det);
       console.log(`   ✗ ${nivel} ${cand.sku} (wc ${cand.id}): ${det}`);
     }
     await pausa(PAUSA);
@@ -293,11 +355,29 @@ async function sincronizarImagenes({
   // ── 2) Nivel variación: hijos sin imagen dentro de padres variables de la web ──
   let padresInsp = 0;
   const padresWeb = webAll.filter(p => p.type === 'variable' && p.id);
+  const topePadres = FORZAR ? Infinity : MAX_PADRES;                 // en actualización completa manda solo el tiempo
+  // Padres de los SKUs en cola (el SKU puede ser la variación o el propio padre): van primero y sin esperar
+  const padresCola = new Set();
+  if (SKUS_COLA.size) {
+    const skus = [...SKUS_COLA];
+    const [pp] = await prodPool.query(
+      `SELECT DISTINCT LOWER(TRIM(vp.sku)) AS psku
+         FROM product_variations pv
+         JOIN product_variations vp ON vp.product_id = pv.product_id AND vp.product_type = 'variable' AND vp.deleted_at IS NULL
+        WHERE pv.deleted_at IS NULL AND LOWER(TRIM(pv.sku)) IN (?)`, [skus]);
+    const psk = new Set(pp.map(r => r.psku));
+    padresWeb.forEach(p => { if (psk.has(String(p.sku || '').trim().toLowerCase())) padresCola.add(p.id); });
+    if (padresCola.size) console.log(`   Cola de SKUs: ${padresCola.size} padre(s) variable(s) a revisar sí o sí.`);
+  }
+  // Primero los de la cola, luego los que hace más tiempo no se revisan (y los nunca revisados)
+  const ultimaInsp = (p) => { const m = memoria.get('vp' + p.id); return m ? new Date(m.intento_en).getTime() : 0; };
+  padresWeb.sort((a, b) => (padresCola.has(b.id) - padresCola.has(a.id)) || (ultimaInsp(a) - ultimaInsp(b)));
   for (const padre of padresWeb) {
-    if (parar() || padresInsp >= MAX_PADRES) break;
+    const deCola = padresCola.has(padre.id);
+    if (parar() || (padresInsp >= topePadres && !deCola)) break;
     const claveP = 'vp' + padre.id;
     const memP = memoria.get(claveP);
-    if (memP && diasDesde(memP.intento_en) < REINSPECT_DIAS) continue; // inspeccionado hace poco
+    if (!FORZAR && !deCola && memP && diasDesde(memP.intento_en) < REINSPECT_DIAS) continue; // inspeccionado hace poco
 
     // Leer variaciones de la web de este padre (id, sku, ¿tiene imagen?)
     const variacionesWeb = [];
@@ -313,6 +393,7 @@ async function sincronizarImagenes({
       }
     } catch (e) { padresInsp++; continue; }
     padresInsp++;
+    padresRevisados.add(padre.id);
 
     const vacias = variacionesWeb.filter(v => v.sku && !v.tieneImg);
     registros.push({ clave: claveP, wc: padre.id, sku: padre.sku, nivel: 'padre-insp', estado: 'ok', detalle: `${vacias.length} variación(es) sin imagen` });
@@ -320,23 +401,26 @@ async function sincronizarImagenes({
 
     const erpV = await imagenesErpDeSkus(prodPool, [...new Set(vacias.map(v => v.sku.toLowerCase()))]);
     for (const v of vacias) {
-      if (parar()) break;
       const clave = 'v' + v.id;
       const mem = memoria.get(clave);
-      if (mem && mem.estado === 'ok') continue;
-      if (enEspera(mem)) {
-        alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: mem.detalle });
-        continue;
-      }
+      // (Si en la memoria quedó "ok" pero la web sigue sin imagen, se vuelve a intentar.)
       const erp = erpV.get(v.sku.toLowerCase());
       const urls = erp ? [...new Set((erp.own.length ? erp.own : erp.prod).filter(Boolean))] : [];
       if (!urls.length) continue;
+      const falta = (situacion) => faltanVar.push({ clave, sku: v.sku, wc: v.id, padre: padre.id, nivel: 'variacion', n: urls.length, situacion });
+      if (enEspera(mem, v.sku)) {
+        alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: mem.detalle });
+        falta(situacionEspera(mem));
+        continue;
+      }
+      if (parar()) { falta(PENDIENTE); continue; }
 
       intentos++;
       const { vivos } = await filtrarVivos(urls.slice(0, 1), LINK_TIMEOUT, PAUSA_LINK); // la variación toma 1 imagen
       if (!vivos.length) {
         alertas.push({ wc: v.id, sku: v.sku, motivo: 'Imagen del ERP no accesible', detalle: (urls[0] || '').slice(0, 255) });
         registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail_link', detalle: 'link no accesible' });
+        falta('El link de la imagen no abre: ' + (urls[0] || ''));
         await pausa(PAUSA); continue;
       }
       try {
@@ -348,11 +432,13 @@ async function sincronizarImagenes({
           const det = 'WooCommerce no guardó la imagen';
           alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: det });
           registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail_wc', detalle: det });
+          falta(det);
         }
       } catch (e) {
         const det = e.response ? `HTTP ${e.response.status}` : (e.message || 'error');
         alertas.push({ wc: v.id, sku: v.sku, motivo: 'Error al subir imagen', detalle: det.slice(0, 255) });
         registros.push({ clave, wc: v.id, sku: v.sku, nivel: 'variacion', estado: 'fail_wc', detalle: det.slice(0, 255) });
+        falta('WooCommerce no la aceptó: ' + det);
         console.log(`   ✗ variación ${v.sku} (wc ${v.id}): ${det}`);
       }
       await pausa(PAUSA);
@@ -361,6 +447,8 @@ async function sincronizarImagenes({
 
   await guardarMemoria(portalPool, registros);
   await guardarAlertasImg(portalPool, alertas);
+  const totalFaltan = await guardarCenso(portalPool, faltanProd, faltanVar, padresRevisados, new Set(padresWeb.map(p => p.id)));
+  console.log(`   Censo: ${totalFaltan} SKU(s) sin imagen en la web pero con imagen en el ERP (${padresRevisados.size} padre(s) variables revisados en esta corrida).`);
   // Éxitos de esta corrida → al detalle de campos, para que aparezcan en el reporte
   // (columna "Campos actualizados" de Variaciones/Actualizados), no en hoja aparte.
   const exitos = registros.filter(r => r.estado === 'ok' && r.nivel !== 'padre-insp');
