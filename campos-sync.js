@@ -15,6 +15,7 @@
 const C = require('./campos');
 const { crearResolvedorTaxonomia } = require('./campos-tax');
 const { ubicacionesExcluidas } = require('./stock-ubicaciones');
+const { crearAvance } = require('./progreso');
 
 // HTML "Pronto en stock / A pedido" (de la pestaña Info: C2 simple, C4 variable)
 const HTML_SIMPLE = "<div id=\"wcapf-active-filters-1\" class=\"woocommerce wcapf-ajax-term-filter widget cf widget_wcapf-active-filters\"><strong><a data-key=\"attra-disponibilidad\" data-value=\"352\" data-multiple-filter=\"\"><span class=\"name\"><font color=\"#E84E0E\">Disponible A PEDIDO.                                        </font></span></a></strong></div>\n<div id=\"wcapf-attribute-filter-6\" class=\"woocommerce wcapf-ajax-term-filter widget cf widget_wcapf-attribute-filter\">\n<div class=\"wcapf-layered-nav et-list-wcapf ps ps--theme_default\" data-ps-id=\"7946ef68-653f-c20b-c5f3-9a8737d12d7d\">\n\n<strong><span class=\"name\">El tiempo de espera es de 2 a 3 semanas. Consultar <a href=\"http://wa.me/51963358335\" target=\"_blank\" rel=\"noopener\"><u>AQUÍ</u></a> para confirmar y/o información más detallada.</span></strong>\n\n<strong><span class=\"name\">Usar código APEDIDO para obtener el descuento de 50% de adelanto y el 50% restante se realiza en la entrega.</span></strong>\n<strong><span class=\"name\">Para compras A pedido <u>SOLO</u> se aceptan <u>pagos con transferencia</u>.</span></strong>\n\n&nbsp;\n\n</div>\n</div>";
@@ -382,8 +383,10 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
   varCambiadas.forEach(v => { if (v.product_type === 'simple') simplesVarCampos[v.wc_id] = payloadVarCampos(v.campos); });
 
   let nPut = 0; // pausa CORTA entre cada PUT (sin ráfagas), para no saturar el hosting
+  const resumenC = () => `${okPadre} productos y ${okVar} variaciones ok, ${err} con error`;
+  const avP = crearAvance('Campos de productos', padreCambiado.length, 'productos');
   for (const p of padreCambiado) {
-    if (nPut++ > 0) await pausa(PAUSA_ITEM);
+    if (nPut++ > 0) { avP.paso(resumenC); await pausa(PAUSA_ITEM); }
     try {
       let body = payloadPadre(p.campos);
       if (p.tipo === 'simple' && simplesVarCampos[p.wc_target]) {
@@ -418,21 +421,26 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
     }
   }
 
+  if (padreCambiado.length) { avP.paso(); avP.fin(resumenC); }
+
   // 4) Simples que cambiaron SOLO en campos de variación (su padre no cambió) → PUT propio
   const simplesSueltos = varCambiadas.filter(v => v.product_type === 'simple' && simplesVarCampos[v.wc_id]);
   let nPut2 = 0;
+  const avS = crearAvance('Campos de simples (reservas, peso, medidas)', simplesSueltos.length, 'productos');
   for (const v of simplesSueltos) {
-    if (nPut2++ > 0) await pausa(PAUSA_ITEM);
+    if (nPut2++ > 0) { avS.paso(resumenC); await pausa(PAUSA_ITEM); }
     try {
       await wc.put(`/products/${v.wc_id}`, simplesVarCampos[v.wc_id]);
       okVar++; varOk.push(v);
     } catch (e) { err++; console.log(`   ✗ simple ${v.sku} (wc ${v.wc_id}): ${detWC(e)}`); }
   }
+  if (simplesSueltos.length) { avS.paso(); avS.fin(resumenC); }
 
   // 5) VARIACIONES (de productos variable) → batch por padre, con lectura del resultado por ítem
   const varsDeVariable = varCambiadas.filter(v => v.product_type === 'variation');
   const porPadre = {};
   varsDeVariable.forEach(v => { (porPadre[v.wc_padre] = porPadre[v.wc_padre] || []).push(v); });
+  const avV = crearAvance('Campos de variaciones', Object.keys(porPadre).length, 'productos padre');
   for (const padre of Object.keys(porPadre)) {
     const grupo = porPadre[padre];
     for (let i = 0; i < grupo.length; i += LOTE) {
@@ -454,7 +462,9 @@ async function sincronizarCamposRicos({ prodPool, portalPool, wc, DRY_RUN, LOTE 
       }
       if (i + LOTE < grupo.length) await pausa(PAUSA);
     }
+    avV.paso(resumenC);
   }
+  avV.fin(resumenC);
 
   // 6) Guardar memoria SOLO de lo que se aplicó bien
   if (varOk.length) await guardarMemoriaVar(portalPool, varOk);

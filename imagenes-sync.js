@@ -27,6 +27,7 @@
 //  vuelve a leer la tienda. Corre en la misma cadencia que esa recolección.
 // ═══════════════════════════════════════════════════════════════════════════
 const axios = require('axios');
+const { crearAvance } = require('./progreso');
 const pausa = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function prepararTabla(portalPool) {
@@ -372,7 +373,11 @@ async function sincronizarImagenes({
   // Primero los de la cola, luego los que hace más tiempo no se revisan (y los nunca revisados)
   const ultimaInsp = (p) => { const m = memoria.get('vp' + p.id); return m ? new Date(m.intento_en).getTime() : 0; };
   padresWeb.sort((a, b) => (padresCola.has(b.id) - padresCola.has(a.id)) || (ultimaInsp(a) - ultimaInsp(b)));
-  for (const padre of padresWeb) {
+  const aRevisar = padresWeb.filter(p => { const m = memoria.get('vp' + p.id);
+    return FORZAR || padresCola.has(p.id) || !(m && diasDesde(m.intento_en) < REINSPECT_DIAS); });
+  const avI = crearAvance('Imágenes de variaciones', Math.min(aRevisar.length, topePadres), 'productos padre');
+  const resumenI = () => `${registros.filter(r => r.estado === 'ok' && r.nivel === 'variacion').length} imágenes subidas`;
+  for (const padre of aRevisar) {
     const deCola = padresCola.has(padre.id);
     if (parar() || (padresInsp >= topePadres && !deCola)) break;
     const claveP = 'vp' + padre.id;
@@ -391,8 +396,9 @@ async function sincronizarImagenes({
         page++; if (page > 50) break;
         await pausa(PAUSA);
       }
-    } catch (e) { padresInsp++; continue; }
+    } catch (e) { padresInsp++; avI.paso(resumenI); continue; }
     padresInsp++;
+    avI.paso(resumenI);
     padresRevisados.add(padre.id);
 
     const vacias = variacionesWeb.filter(v => v.sku && !v.tieneImg);
@@ -445,6 +451,7 @@ async function sincronizarImagenes({
     }
   }
 
+  if (padresInsp) avI.fin(resumenI);
   await guardarMemoria(portalPool, registros);
   await guardarAlertasImg(portalPool, alertas);
   const totalFaltan = await guardarCenso(portalPool, faltanProd, faltanVar, padresRevisados, new Set(padresWeb.map(p => p.id)));

@@ -36,6 +36,7 @@ const axios = require('axios');
 const { sincronizarCamposRicos } = require('./campos-sync');
 const { recolectarPendientesWeb } = require('./pendientes-web');
 const { ubicacionesExcluidas } = require('./stock-ubicaciones');
+const { crearAvance } = require('./progreso');
 const { sincronizarImagenes } = require('./imagenes-sync');
 // Activa/desactiva la fase de campos ricos (nombre, publicado, visibilidad, etc.)
 const SYNC_CAMPOS = process.env.SYNC_CAMPOS !== 'false'; // por defecto activada
@@ -620,7 +621,10 @@ async function main() {
       const todasDiscrepancias = [];
 
       // 4a. Productos simples → validar SKU por lote, luego batch
+      const nLotesSimples = Math.ceil(simples.length / LOTE_SIMPLES);
+      const avS = crearAvance('Simples (stock y precio)', nLotesSimples, 'lotes');
       for (let i = 0; i < simples.length; i += LOTE_SIMPLES) {
+        if (i > 0) avS.paso(() => `${okTotal} ok, ${errTotal} con error`);
         const loteOriginal = simples.slice(i, i + LOTE_SIMPLES);
         const nLote = Math.floor(i / LOTE_SIMPLES) + 1;
         // Validar SKU (lee el lote de WooCommerce en 1 llamada)
@@ -633,7 +637,7 @@ async function main() {
             console.log(`   ⚠ Lote simples #${nLote}: ${discrepancias.length} con SKU distinto (no se actualizan).`);
           }
         }
-        console.log(`   Lote simples #${nLote}: ${lote.length} productos...`);
+        console.log(`   Lote simples #${nLote}/${nLotesSimples}: ${lote.length} productos...`);
         if (lote.length === 0) { if (i + LOTE_SIMPLES < simples.length) await pausa(PAUSA_LOTE_MS); continue; }
         if (!DRY_RUN) {
           try {
@@ -659,6 +663,7 @@ async function main() {
         }
         if (i + LOTE_SIMPLES < simples.length) await pausa(PAUSA_LOTE_MS);
       }
+      if (simples.length) { avS.paso(); avS.fin(() => `${okTotal} ok, ${errTotal} con error`); }
 
       // 4b. Variaciones → validar SKU por padre, luego batch
       if (variaciones.length) {
@@ -666,6 +671,9 @@ async function main() {
         const grupos = agruparVariacionesPorPadre(variaciones);
         const padres = Object.keys(grupos);
         console.log(`   Variaciones agrupadas en ${padres.length} productos padre...`);
+        const okAntesV = okTotal, errAntesV = errTotal;
+        const resumenV = () => `${okTotal - okAntesV} variaciones ok, ${errTotal - errAntesV} con error`;
+        const avV = crearAvance('Variaciones (stock y precio)', padres.length, 'productos padre');
         let idx = 0;
         for (const padre of padres) {
           const grupo = grupos[padre];
@@ -719,8 +727,10 @@ async function main() {
             }
           }
           idx++;
+          avV.paso(resumenV);
           if (idx < padres.length) await pausa(PAUSA_LOTE_MS);
         }
+        avV.fin(resumenV);
       }
 
       // Guardar discrepancias de SKU para el reporte (solo en corrida real)
